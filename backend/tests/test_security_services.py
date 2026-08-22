@@ -9,6 +9,7 @@ import pytest
 import soundfile as sf
 import cv2
 
+from sqlalchemy import select
 from app.database import engine, SessionLocal, init_db, drop_db
 from app.models import (
     Base,
@@ -222,8 +223,11 @@ def test_hash_chain_workflow_and_tampering(db):
         db.refresh(c)
 
     # Add blocks
+    latest_before = db.execute(select(HashChainEntry).order_by(HashChainEntry.id.desc()).limit(1)).scalar_one_or_none()
+    expected_initial_prev = latest_before.current_hash if latest_before else create_genesis_block()
+
     b1 = add_block(db, contents[0].id, {"file": "doc1.pdf"})
-    assert b1.prev_hash == create_genesis_block()
+    assert b1.prev_hash == expected_initial_prev
 
     b2 = add_block(db, contents[1].id, {"file": "doc2.pdf"})
     assert b2.prev_hash == b1.current_hash

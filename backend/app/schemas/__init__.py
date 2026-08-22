@@ -176,24 +176,29 @@ class RevokeContentRequest(BaseModel):
 # Verification Schemas
 # ============================================================================
 
-class VerifyTextRequest(BaseModel):
-    text: str = Field(..., min_length=1)
-
-
 class EvidenceBundle(BaseModel):
     match_type: str  # "EXACT_SHA256", "PERCEPTUAL_SIMILARITY", "NONE"
     sha256_submitted: str
     matched_hash: Optional[str] = None
+    sha256_match: Optional[bool] = None
     similarity_score: float = 0.0
     publisher_name: Optional[str] = None
     publisher_domain: Optional[str] = None
     publisher_public_key: Optional[str] = None
     digital_signature: Optional[str] = None
     signature_valid: bool = False
+    signing_algorithm: Optional[str] = "Ed25519"
     manifest_valid: bool = False
+    manifest_data: Optional[Dict[str, Any]] = None
     chain_block_id: Optional[int] = None
     chain_integrity: bool = False
     content_metadata: Optional[Dict[str, Any]] = None
+    perceptual_hash_submitted: Optional[Dict[str, Any]] = None
+    perceptual_hash_matched: Optional[Dict[str, Any]] = None
+    perceptual_similarity_score: Optional[float] = None
+    perceptual_match_status: Optional[str] = None  # "EXACT_MATCH", "SIMILAR_MATCH", "NO_MATCH", "NOT_APPLICABLE"
+    notice: Optional[str] = None
+    superseded_by_id: Optional[str] = None
 
 
 class VerificationResponse(BaseModel):
@@ -205,6 +210,10 @@ class VerificationResponse(BaseModel):
     matched_content: Optional[ContentResponse] = None
     evidence_bundle: EvidenceBundle
     created_at: str
+
+
+class VerifyTextRequest(BaseModel):
+    text: str = Field(..., min_length=1)
 
 
 # ============================================================================

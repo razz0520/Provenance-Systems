@@ -1,6 +1,6 @@
 """Publisher and Official Content Registration Service."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 import os
@@ -125,7 +125,7 @@ class PublisherService:
                 saved_path.unlink()
             raise ValueError(f"Content with identical SHA-256 ({sha256_hash}) is already registered: ID {existing.id}")
 
-        # Step 2: Calculate Perceptual Hash
+        # Step 2: Calculate Genuine Perceptual Hash
         perceptual_hash_data: Dict[str, Any] = {}
         duration_seconds: Optional[float] = None
 
@@ -133,19 +133,40 @@ class PublisherService:
             if content_type == ContentType.IMAGE:
                 phash = generate_image_phash(saved_path)
                 dhash = generate_image_dhash(saved_path)
-                perceptual_hash_data = {"phash": phash, "dhash": dhash}
+                perceptual_hash_data = {
+                    "algorithm": "pHash + dHash",
+                    "phash": phash,
+                    "dhash": dhash,
+                }
             elif content_type == ContentType.VIDEO:
                 v_phash = generate_video_phash(saved_path, fps=1.0)
                 perceptual_hash_data = v_phash
                 duration_seconds = v_phash.get("duration_seconds")
             elif content_type == ContentType.AUDIO:
                 afp = generate_audio_fingerprint(saved_path)
-                perceptual_hash_data = {"audio_fingerprint": afp}
-            else:
-                perceptual_hash_data = {"sha256": sha256_hash}
+                perceptual_hash_data = {
+                    "algorithm": "MFCC + Chroma Fingerprint",
+                    "audio_fingerprint": afp,
+                }
+            elif content_type == ContentType.PDF:
+                perceptual_hash_data = {
+                    "status": "NOT_APPLICABLE",
+                    "media_type": "PDF",
+                    "reason": "Perceptual hashing applies to visual and acoustic media. Document authenticity is verified via SHA-256 cryptographic hashing.",
+                }
+            else:  # TEXT
+                perceptual_hash_data = {
+                    "status": "NOT_APPLICABLE",
+                    "media_type": "TEXT",
+                    "reason": "Perceptual hashing applies to visual and acoustic media. Statement authenticity is verified via SHA-256 cryptographic hashing.",
+                }
         except Exception as e:
-            logger.warning("Perceptual hashing error for %s: %s", saved_path, e)
-            perceptual_hash_data = {"sha256": sha256_hash}
+            logger.warning("Perceptual hashing exception for %s: %s", saved_path, e)
+            perceptual_hash_data = {
+                "status": "FAILED",
+                "error": str(e),
+                "reason": "Could not compute media perceptual fingerprint.",
+            }
 
         # Step 3: Find or create active Credential for publisher
         credential = db.execute(
@@ -163,7 +184,7 @@ class PublisherService:
                 credential_type=CredentialType.PRIMARY,
                 status=CredentialStatus.ACTIVE,
                 valid_from=now,
-                valid_until=now + datetime.timedelta(days=365),
+                valid_until=now + timedelta(days=365),
             )
             db.add(credential)
             db.flush()
@@ -186,24 +207,33 @@ class PublisherService:
         db.add(registered_content)
         db.flush()
 
-        # Step 5: Generate & Sign Cryptographic Manifest
+        # Step 5: Keypair Management & Signing
+        if private_key_pem:
+            priv_key = deserialize_private_key(private_key_pem)
+            pub_key = priv_key.public_key()
+            pub_pem = serialize_public_key(pub_key)
+        else:
+            # Generate or use publisher keypair
+            priv_key, pub_key = generate_ed25519_keypair()
+            pub_pem = serialize_public_key(pub_key)
+            if not publisher.public_key:
+                publisher.public_key = pub_pem
+                db.flush()
+
+        # Generate standardized provenance manifest
         manifest_payload = create_manifest(
             publisher_id=publisher.id,
             content_hash=sha256_hash,
             content_type=content_type.value,
             metadata=metadata or {},
         )
+        # Anchor the signing public key in the manifest for self-contained proof
+        manifest_payload["publisher_public_key"] = pub_pem
+        manifest_payload["publisher_name"] = publisher.organization_name
+        manifest_payload["publisher_domain"] = publisher.organization_domain
 
         # Sign manifest
-        if private_key_pem:
-            priv_key = deserialize_private_key(private_key_pem)
-            signature = sign_manifest(manifest_payload, priv_key)
-        else:
-            # If private key not explicitly supplied, generate keypair and bind to publisher
-            priv_key, pub_key = generate_ed25519_keypair()
-            publisher.public_key = serialize_public_key(pub_key)
-            db.flush()
-            signature = sign_manifest(manifest_payload, priv_key)
+        signature = sign_manifest(manifest_payload, priv_key)
 
         manifest = CryptographicManifest(
             content_id=registered_content.id,
@@ -222,6 +252,7 @@ class PublisherService:
                 "sha256": sha256_hash,
                 "publisher_id": str(publisher.id),
                 "original_filename": original_name,
+                "signature": signature[:16] + "...",
             },
         )
 
