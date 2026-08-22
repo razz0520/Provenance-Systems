@@ -1,0 +1,20 @@
+﻿{
+  "test_cases": [
+    {
+      "id": "TC001",
+      "name": "Original Video",
+      "file": "original/video1.mp4",
+      "type": "VIDEO",
+      "expected_verdict": "VERIFIED",
+      "expected_similarity": ">95%"
+    },
+    {
+      "id": "TC003",
+      "name": "Modified Video",
+      "file": "modified/video1_modified.mp4",
+      "type": "VIDEO",
+      "expected_verdict": "SUSPICIOUS",
+      "expected_similarity": "70-85%"
+    }
+  ]
+}
