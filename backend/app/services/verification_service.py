@@ -57,7 +57,7 @@ class VerificationService:
                     "dhash": dh,
                 }
             elif ext_clean in ["mp4", "avi", "mov", "mkv", "webm"]:
-                return generate_video_phash(file_path, fps=1.0)
+                return generate_video_phash(file_path, fps=2.0)
             elif ext_clean in ["mp3", "wav", "ogg", "flac", "m4a"]:
                 afp = generate_audio_fingerprint(file_path)
                 return {

@@ -316,19 +316,34 @@ class PerceptualHashService:
                 if not frames1 or not frames2:
                     return 0.0
 
+                def _frame_sim(f1: Dict[str, Any], f2: Dict[str, Any]) -> float:
+                    p1 = f1.get("phash", "")
+                    p2 = f2.get("phash", "")
+                    d1 = f1.get("dhash", p1)
+                    d2 = f2.get("dhash", p2)
+                    ps = cls.compare_perceptual_hashes(p1, p2)
+                    ds = cls.compare_perceptual_hashes(d1, d2) if (d1 and d2) else ps
+                    return (ps * 0.6) + (ds * 0.4)
+
+                # Direct lockstep comparison (for exact or near-identical videos)
                 min_len = min(len(frames1), len(frames2))
-                if min_len == 0:
-                    return 0.0
+                direct_score = 0.0
+                if min_len > 0:
+                    direct_scores = [_frame_sim(frames1[i], frames2[i]) for i in range(min_len)]
+                    direct_score = float(np.mean(direct_scores))
+                    if direct_score >= 95.0 and len(frames1) == len(frames2):
+                        return round(direct_score, 2)
 
-                frame_scores: List[float] = []
-                for i in range(min_len):
-                    ph1 = frames1[i].get("phash", "")
-                    ph2 = frames2[i].get("phash", "")
-                    if ph1 and ph2:
-                        score = cls.compare_perceptual_hashes(ph1, ph2)
-                        frame_scores.append(score)
+                # Sequence alignment: match reference frames against candidate frames
+                shorter, longer = (frames1, frames2) if len(frames1) <= len(frames2) else (frames2, frames1)
+                ref_matches = [max(_frame_sim(sf, lf) for lf in longer) for sf in shorter]
 
-                return round(float(np.mean(frame_scores)), 2) if frame_scores else 0.0
+                # Top-80% aligned mean (robust against localized edits / deepfake alterations)
+                top_k = max(1, int(len(ref_matches) * 0.8))
+                aligned_score = float(np.mean(sorted(ref_matches, reverse=True)[:top_k]))
+
+                final_score = max(direct_score, aligned_score)
+                return round(float(final_score), 2)
 
             s1 = str(hash1).strip().lower()
             s2 = str(hash2).strip().lower()

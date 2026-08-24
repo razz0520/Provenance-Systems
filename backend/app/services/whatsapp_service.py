@@ -319,8 +319,12 @@ class WhatsAppService:
 
             # Help / Greeting Keywords
             if text_body.lower() in ["hi", "hello", "hey", "help", "info", "start", "menu", "verify"]:
-                reply_text = cls.format_help_response(sender_name=sender_name)
-                cls.send_whatsapp_message(to_number=from_number, message_text=reply_text)
+                help_payload = cls.format_help_response(sender_name=sender_name)
+                cls.send_interactive_message(
+                    to_number=from_number,
+                    body_text=help_payload["body_text"],
+                    buttons=help_payload["buttons"],
+                )
                 return {"type": "help", "recipient": from_number}
 
             # Verification of press release or text statement (with Redis caching)
@@ -336,8 +340,12 @@ class WhatsAppService:
                     verif_result = verify_text(db=db, text_content=text_body)
                     cls.set_cached_verification(cache_key, verif_result)
 
-                reply_text = cls.format_verification_result(verif_result)
-                cls.send_whatsapp_message(to_number=from_number, message_text=reply_text)
+                verdict_payload = cls.format_verification_result(verif_result)
+                cls.send_interactive_message(
+                    to_number=from_number,
+                    body_text=verdict_payload["body_text"],
+                    buttons=verdict_payload["buttons"],
+                )
                 return {
                     "type": "text_verification",
                     "verification_id": verif_result.get("verification_id"),
@@ -347,9 +355,7 @@ class WhatsAppService:
                 logger.error("Text verification failed for WhatsApp: %s", e)
                 cls.send_whatsapp_message(
                     to_number=from_number,
-                    message_text=cls.format_invalid_response(
-                        "Failed to verify text statement. Please ensure it is valid text."
-                    ),
+                    message_text="⚠️ We couldn't verify that text statement. Please try again.",
                 )
                 return {"error": str(e)}
 
@@ -363,7 +369,7 @@ class WhatsAppService:
             if not media_id:
                 cls.send_whatsapp_message(
                     to_number=from_number,
-                    message_text=cls.format_invalid_response("Could not read attached media file identifier."),
+                    message_text="⚠️ Could not read attached media file identifier.",
                 )
                 return {"error": "missing_media_id"}
 
@@ -382,14 +388,56 @@ class WhatsAppService:
             )
 
             if res.get("success"):
-                reply_text = cls.format_verification_result(res["verification_result"])
+                verdict_payload = cls.format_verification_result(res["verification_result"])
+                cls.send_interactive_message(
+                    to_number=from_number,
+                    body_text=verdict_payload["body_text"],
+                    buttons=verdict_payload["buttons"],
+                )
             else:
-                reply_text = cls.format_invalid_response(res.get("error", "Could not verify media file."))
+                error_msg = res.get("error", "Could not verify media file.")
+                cls.send_whatsapp_message(to_number=from_number, message_text=f"⚠️ {error_msg}")
 
-            cls.send_whatsapp_message(to_number=from_number, message_text=reply_text)
             return res
 
-        # 6. Unsupported Type
+        # 6. Interactive Button Replies
+        elif msg_type == "interactive":
+            button_reply = message.get("interactive", {}).get("button_reply", {})
+            button_id = button_reply.get("id", "")
+
+            if button_id.startswith("btn_proof"):
+                parts = button_id.split(":", 1)
+                verification_id = parts[1] if len(parts) > 1 else None
+                proof_result = get_verification_result(db, verification_id) if verification_id else None
+                proof_text = cls.format_proof_message(proof_result)
+                cls.send_whatsapp_message(to_number=from_number, message_text=proof_text)
+                return {"type": "proof_sent", "recipient": from_number}
+
+            elif button_id == "btn_report":
+                report_text = (
+                    "📝 *Report this content officially*\n\n"
+                    "Our system does not handle government complaints directly. Please use "
+                    "the official PIB Fact Check Portal to submit this content for investigation.\n\n"
+                    "🔗 https://factcheck.pib.gov.in/"
+                )
+                cls.send_whatsapp_message(to_number=from_number, message_text=report_text)
+                return {"type": "report_redirect", "recipient": from_number}
+
+            elif button_id == "btn_explainer":
+                cls.send_whatsapp_message(
+                    to_number=from_number,
+                    message_text=cls.format_explainer_message(),
+                )
+                return {"type": "explainer_sent", "recipient": from_number}
+
+            else:
+                cls.send_whatsapp_message(
+                    to_number=from_number,
+                    message_text="Please send an image, video, audio clip, or text to verify.",
+                )
+                return {"type": "unknown_button", "button_id": button_id}
+
+        # 7. Unsupported Type
         else:
             reply_text = (
                 f"⚠️ *Unsupported message type:* `{msg_type}`\n\n"
@@ -572,11 +620,12 @@ class WhatsAppService:
     # ========================================================================
 
     @classmethod
-    def format_verification_result(cls, result: Dict[str, Any]) -> str:
-        """Dispatch result formatting based on verdict."""
+    def format_verification_result(cls, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Dispatch result formatting based on verdict. Returns interactive payload."""
         verdict = result.get("verdict", "")
         evidence = result.get("evidence_bundle", {})
         matched_content = result.get("matched_content") or {}
+        verification_id = result.get("verification_id", "")
 
         # Merge matched content fields for richer display
         merged_evidence = dict(evidence)
@@ -585,181 +634,259 @@ class WhatsAppService:
             merged_evidence["content_type"] = matched_content.get("content_type")
 
         if verdict == VerificationVerdict.VERIFIED.value:
-            return cls.format_verified_response(merged_evidence, confidence=result.get("confidence_score", 1.0))
+            payload = cls.format_verified_response(merged_evidence)
         elif verdict == VerificationVerdict.SUSPICIOUS.value:
-            return cls.format_suspicious_response(merged_evidence, confidence=result.get("confidence_score", 0.0))
+            payload = cls.format_suspicious_response(merged_evidence)
         elif verdict == VerificationVerdict.PROVEN_INVALID.value:
-            return cls.format_invalid_response(
-                merged_evidence.get("notice") or "Cryptographic signature or manifest validation failed."
-            )
+            payload = cls.format_invalid_response()
         else:
-            return cls.format_unsigned_response()
+            payload = cls.format_unsigned_response()
+
+        # Attach verification_id to proof button for targeted retrieval
+        if verification_id:
+            for btn in payload.get("buttons", []):
+                if btn.get("id") == "btn_proof":
+                    btn["id"] = f"btn_proof:{verification_id}"
+
+        return payload
 
     @classmethod
     def format_verified_response(
         cls,
         evidence: Dict[str, Any],
         confidence: float = 1.0,
-    ) -> str:
-        """Format official VERIFIED response template for WhatsApp."""
+    ) -> Dict[str, Any]:
+        """Format official VERIFIED response as interactive message payload."""
         publisher = (
             evidence.get("publisher_organization")
             or evidence.get("publisher_name")
             or "Official Government Authority"
         )
 
+        content_type_raw = str(evidence.get("content_type", "")).lower()
+        type_labels = {
+            "image": "image",
+            "video": "video",
+            "audio": "audio",
+            "document": "document",
+            "text": "statement",
+        }
+        type_label = type_labels.get(content_type_raw, "document")
+
         manifest = evidence.get("manifest_data") or {}
         raw_ts = manifest.get("timestamp") or evidence.get("created_at")
-        formatted_date = "Recently Verified"
+        formatted_date = "recently"
         if raw_ts:
             try:
                 dt = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
-                formatted_date = dt.strftime("%d %b %Y, %H:%M UTC")
+                formatted_date = dt.strftime("%d %b %Y")
             except Exception:
-                formatted_date = str(raw_ts)[:19]
+                formatted_date = str(raw_ts)[:10]
 
-        filename = evidence.get("original_filename") or "Official Media Release"
-        block_id = evidence.get("chain_block_id") or "1"
-        confidence_pct = int(confidence * 100) if confidence <= 1.0 else int(confidence)
+        body_text = (
+            f"✅ *Verified official content* — this {type_label} matches an official "
+            f"release from *{publisher}*, published {formatted_date}. "
+            f"It has not been edited or manipulated."
+        )
 
-        phash_info = evidence.get("perceptual_hash") or {}
-        sim_pct = phash_info.get("similarity_percentage", 100)
-
-        lines = [
-            "🛡️ *OFFICIAL GOVERNMENT CONTENT VERIFIED*",
-            "━━━━━━━━━━━━━━━━━━━━━━",
-            f"🏛️ *Publisher:* {publisher}",
-            f"📅 *Timestamp:* {formatted_date}",
-            f"📄 *Subject:* {filename}",
-            f"🔐 *Digital Signature:* Valid (Ed25519)",
-            f"⛓️ *Ledger Anchor:* Block #{block_id}",
-            f"📊 *Confidence Score:* {confidence_pct}%",
-            "",
-            "🔍 *Cryptographic Verification Proof:*",
-            "  • *SHA-256 Hash:* Exact Bit-Level Match ✅",
-            f"  • *Perceptual Fingerprint:* {sim_pct}% Acoustic/Visual Match ✅",
-            "  • *Ed25519 Signature:* Cryptographically Valid ✅",
-            "  • *Provenance Manifest:* Authenticated Schema ✅",
-            f"  • *Hash-Chain Ledger:* Block #{block_id} Integrity Confirmed ✅",
-            "",
-            "━━━━━━━━━━━━━━━━━━━━━━",
-            "✅ *Authentic:* This content is officially published and signed by the authorized government publisher. It has not been tampered with or deepfaked.",
-        ]
-        return "\n".join(lines)
+        return {
+            "body_text": body_text,
+            "buttons": [
+                {"id": "btn_proof", "title": "How was this checked"},
+            ],
+        }
 
     @classmethod
     def format_suspicious_response(
         cls,
         evidence: Dict[str, Any],
         confidence: float = 0.0,
-    ) -> str:
-        """Format SUSPICIOUS / Altered Content response template."""
+    ) -> Dict[str, Any]:
+        """Format SUSPICIOUS / Altered Content response as interactive message payload."""
         publisher = (
             evidence.get("publisher_organization")
             or evidence.get("publisher_name")
             or "Official Government Source"
         )
-        phash_info = evidence.get("perceptual_hash") or {}
-        similarity = phash_info.get("similarity_percentage") or int(confidence * 100)
-        notice = (
-            evidence.get("notice")
-            or "Media shows strong visual or acoustic similarity to official releases but cryptographic hashes do not match."
+
+        body_text = (
+            f"⚠️ *This appears to be a modified version* of official content from *{publisher}*. "
+            f"Parts may have been altered or taken out of context."
         )
 
-        lines = [
-            "⚠️ *SUSPICIOUS / ALTERED CONTENT DETECTED*",
-            "━━━━━━━━━━━━━━━━━━━━━━",
-            "🚨 *Tampering / Modification Warning*",
-            f"This media matches an official government publication ({similarity}% similarity) but has failed bit-level integrity checks.",
-            "",
-            f"🏛️ *Matched Publisher:* {publisher}",
-            f"📊 *Perceptual Similarity:* {similarity}%",
-            "❌ *SHA-256 Hash:* Mismatched (Altered/Re-encoded)",
-            "⚠️ *Digital Signature:* Broken or Invalid",
-            "",
-            f"📌 *Analysis:* {notice}",
-            "",
-            "━━━━━━━━━━━━━━━━━━━━━━",
-            "⛔ *Recommendation:* Do NOT forward or rely on this media without official verification. It may be an edited clip, cropped segment, or deepfake derivative.",
-        ]
-        return "\n".join(lines)
+        return {
+            "body_text": body_text,
+            "buttons": [
+                {"id": "btn_proof", "title": "How was this checked"},
+                {"id": "btn_report", "title": "Report this content"},
+            ],
+        }
 
     @classmethod
-    def format_unsigned_response(cls) -> str:
-        """Format UNSIGNED (no official record) response template."""
-        lines = [
-            "ℹ️ *NO OFFICIAL RECORD FOUND (UNSIGNED)*",
-            "━━━━━━━━━━━━━━━━━━━━━━",
-            "This media or text is *not registered* in the National Government Provenance Registry.",
-            "",
-            "🔍 *Details:*",
-            "• No matching SHA-256 cryptographic hash found.",
-            "• No matching perceptual fingerprint in official archives.",
-            "• No authorized government digital signature attached.",
-            "",
-            "⚠️ *Note:* This does not automatically indicate malicious intent, but confirms that no authorized government agency has cryptographically signed this file.",
-            "",
-            "💡 *Tips:*",
-            "• Verify news directly via official `.gov.in` portals.",
-            "• Submit the original uncompressed file if available.",
-        ]
-        return "\n".join(lines)
+    def format_unsigned_response(cls) -> Dict[str, Any]:
+        """Format UNSIGNED response as interactive message payload."""
+        body_text = (
+            "❓ *We can't confirm this is official government content* — it isn't in our "
+            "verified records. This doesn't necessarily mean it's fake, only that no "
+            "government publisher has registered it."
+        )
+
+        return {
+            "body_text": body_text,
+            "buttons": [
+                {"id": "btn_proof", "title": "How was this checked"},
+                {"id": "btn_report", "title": "Report this content"},
+            ],
+        }
 
     @classmethod
-    def format_invalid_response(cls, reason: str = "Invalid content or corrupted file.") -> str:
-        """Format INVALID / ERROR response template."""
-        lines = [
-            "❌ *VERIFICATION FAILED / INVALID*",
-            "━━━━━━━━━━━━━━━━━━━━━━",
-            f"⚠️ *Reason:* {reason}",
-            "",
-            "📌 *Supported Formats:*",
-            "• 📷 *Images:* JPG, PNG, WebP",
-            "• 🎥 *Videos:* MP4, MOV, AVI",
-            "• 🎙️ *Audio:* MP3, WAV, M4A",
-            "• 📄 *Documents:* PDF",
-            "• 💬 *Text:* Official Statements & Press Releases",
-            "",
-            "Please upload or forward an authentic media file or statement to verify.",
-        ]
-        return "\n".join(lines)
+    def format_invalid_response(cls, reason: str = "Invalid content or corrupted file.") -> Dict[str, Any]:
+        """Format INVALID response as interactive message payload."""
+        body_text = (
+            "🚫 *This does not match any official record* and shows signs of tampering. "
+            "Treat this content with caution."
+        )
+
+        return {
+            "body_text": body_text,
+            "buttons": [
+                {"id": "btn_proof", "title": "How was this checked"},
+                {"id": "btn_report", "title": "Report this content"},
+            ],
+        }
 
     @classmethod
     def format_rate_limit_response(cls) -> str:
-        """Format Rate Limit warning response."""
-        lines = [
-            "⏳ *Rate Limit Exceeded*",
-            "━━━━━━━━━━━━━━━━━━━━━━",
-            "You have submitted too many requests in a short period.",
-            "",
-            "Please wait a minute before submitting additional media or statements for verification.",
-        ]
-        return "\n".join(lines)
+        """Format Rate Limit warning response as concise plain text."""
+        return (
+            "⏳ *Rate Limit Exceeded*\n\n"
+            "You have submitted too many requests in a short period.\n"
+            "Please wait a minute before submitting additional media or statements for verification."
+        )
 
     @classmethod
-    def format_help_response(cls, sender_name: str = "Citizen") -> str:
-        """Format Greeting / Help Menu."""
+    def format_help_response(cls, sender_name: str = "Citizen") -> Dict[str, Any]:
+        """Format Greeting / Onboarding Menu with interactive button."""
+        body_text = (
+            f"👋 *Welcome {sender_name}!*\n\n"
+            "This number checks if media or text is official government content.\n\n"
+            "*How to verify:*\n"
+            "1️⃣ Forward an image, video, or audio clip\n"
+            "2️⃣ Paste a text statement or press release\n"
+            "3️⃣ Get your result in seconds"
+        )
+        return {
+            "body_text": body_text,
+            "buttons": [
+                {"id": "btn_explainer", "title": "What is verified?"},
+            ],
+        }
+
+    @classmethod
+    def format_proof_message(cls, result: Optional[Dict[str, Any]]) -> str:
+        """Format proof-on-tap message showing only signals actually present in the result."""
+        if not result:
+            return (
+                "ℹ️ Verification proof details are unavailable.\n"
+                "Please submit the media or statement to verify again."
+            )
+
+        evidence = result.get("evidence_bundle") or {}
+        verdict = result.get("verdict", "")
+        lines: List[str] = ["*How this was checked:*", ""]
+
+        # 1. SHA-256 hash match
+        if evidence.get("sha256_match") is True:
+            lines.append("• Matches the original file — exact match")
+            lines.append("  _Technical: SHA-256 hash match confirmed_")
+            lines.append("")
+        elif evidence.get("match_type") == "PERCEPTUAL_SIMILARITY":
+            lines.append("• File content differs from the original — not an exact copy")
+            lines.append("  _Technical: SHA-256 hash mismatch (altered or re-encoded)_")
+            lines.append("")
+
+        # 2. Perceptual fingerprint match
+        perceptual_status = evidence.get("perceptual_match_status", "")
+        if perceptual_status == "EXACT_MATCH":
+            lines.append("• Looks and sounds like the original — exact match")
+            lines.append("  _Technical: Perceptual fingerprint (pHash/dHash) exact match_")
+            lines.append("")
+        elif perceptual_status == "SIMILAR_MATCH":
+            sim = evidence.get("perceptual_similarity_score") or evidence.get("similarity_score", 0)
+            lines.append(f"• Looks and sounds like the original — {int(sim)}% match")
+            lines.append(f"  _Technical: Perceptual fingerprint similarity {sim}%_")
+            lines.append("")
+
+        # 3. Ed25519 digital signature
+        if evidence.get("digital_signature") is not None:
+            if evidence.get("signature_valid") is True:
+                lines.append("• Digitally signed by the publisher — valid")
+                lines.append("  _Technical: Ed25519 cryptographic signature verified_")
+            else:
+                lines.append("• Digital signature check — failed")
+                lines.append("  _Technical: Ed25519 digital signature invalid or broken_")
+            lines.append("")
+
+        # 4. C2PA provenance manifest
+        if evidence.get("manifest_data") is not None:
+            if evidence.get("manifest_valid") is True:
+                lines.append("• Official provenance record — valid")
+                lines.append("  _Technical: C2PA-standard provenance manifest authenticated_")
+            else:
+                lines.append("• Provenance record check — failed")
+                lines.append("  _Technical: C2PA provenance manifest validation failed_")
+            lines.append("")
+
+        # 5. Hash-chain ledger anchoring
+        if evidence.get("chain_block_id") is not None:
+            block_id = evidence.get("chain_block_id")
+            if evidence.get("chain_integrity") is True:
+                lines.append("• Recorded on tamper-proof ledger — confirmed")
+                lines.append(f"  _Technical: Hash-chain ledger block #{block_id} integrity confirmed_")
+            else:
+                lines.append("• Ledger record check — failed")
+                lines.append(f"  _Technical: Hash-chain ledger block #{block_id} integrity could not be confirmed_")
+            lines.append("")
+
+        # Fallback if no individual signals were present
+        if len(lines) <= 2:
+            if verdict == VerificationVerdict.UNSIGNED.value or verdict == "UNSIGNED":
+                lines.append("• Registry check — no matching records found")
+                lines.append("  _Technical: No SHA-256, fingerprint, or signature match in registry_")
+            elif verdict == VerificationVerdict.PROVEN_INVALID.value or verdict == "PROVEN_INVALID":
+                lines.append("• Authenticity check — failed")
+                lines.append("  _Technical: Cryptographic signature or manifest validation failed_")
+            else:
+                notice = evidence.get("notice", "")
+                if notice:
+                    lines.append(f"_{notice}_")
+                else:
+                    lines.append("_No detailed verification signals available._")
+
+        return "\n".join(lines).strip()
+
+    @classmethod
+    def format_explainer_message(cls) -> str:
+        """Full technical explainer sent on tap of 'What is verified?' button."""
         lines = [
-            f"👋 *Welcome {sender_name} to the Government Content Verification Tipline*",
-            "━━━━━━━━━━━━━━━━━━━━━━",
-            "🛡️ *National Content Provenance Registry*",
+            "*What does 'verified' mean?*",
             "",
-            "Citizens can verify official government communications, press releases, audio clips, images, and videos in seconds.",
+            "When an official authority releases content, our system creates a tamper-proof digital record using 5 security mechanisms:",
             "",
-            "📲 *How to Verify:*",
-            "1. *Forward or upload* any image, video, voice note, or PDF directly to this chat.",
-            "2. *Paste* official text or press release statements.",
-            "3. Our AI & cryptographic engine will cross-check the *Tamper-Proof Provenance Ledger*.",
+            "*1. Cryptographic File Fingerprint (SHA-256)*",
+            "A unique mathematical hash of the file. Even a 1-pixel or 1-byte change creates a completely different hash.",
             "",
-            "🔒 *Security Mechanisms Applied:*",
-            "✅ SHA-256 Bit-level Hash Verification",
-            "✅ Perceptual Audio/Visual Fingerprinting",
-            "✅ Ed25519 Digital Signature Validation",
-            "✅ C2PA-Standard Provenance Manifests",
-            "✅ Immutable Hash-Chain Ledger Anchoring",
+            "*2. Acoustic & Visual Fingerprint (pHash/dHash/MFCC)*",
+            "A perceptual fingerprint that identifies the underlying image, video, or audio even across compression and resizing.",
             "",
-            "━━━━━━━━━━━━━━━━━━━━━━",
-            "_Send any media or text message now to begin verification._",
+            "*3. Authorized Digital Signature (Ed25519)*",
+            "Signed using the publisher's private key. Verifies authenticity and non-repudiation.",
+            "",
+            "*4. C2PA Provenance Manifest*",
+            "An open-standard manifest detailing authorship, timestamps, and editing history.",
+            "",
+            "*5. Immutable Hash-Chain Ledger*",
+            "Every publication is permanently anchored into a tamper-evident cryptographic hash chain.",
         ]
         return "\n".join(lines)
 
@@ -822,6 +949,75 @@ class WhatsAppService:
             return False
 
     @classmethod
+    def send_interactive_message(
+        cls,
+        to_number: str,
+        body_text: str,
+        buttons: List[Dict[str, str]],
+    ) -> bool:
+        """Send an interactive reply-button message via Meta WhatsApp Cloud API."""
+        phone_number_id = settings.WHATSAPP_PHONE_NUMBER_ID
+        access_token = settings.WHATSAPP_ACCESS_TOKEN
+
+        api_buttons = []
+        for btn in buttons[:3]:
+            api_buttons.append({
+                "type": "reply",
+                "reply": {
+                    "id": btn["id"],
+                    "title": btn["title"][:20],
+                },
+            })
+
+        if not phone_number_id or not access_token:
+            logger.warning(
+                "WhatsApp credentials not configured. Simulating interactive dispatch to %s:\n%s\nButtons: %s",
+                to_number,
+                body_text,
+                [b["title"] for b in buttons],
+            )
+            return True
+
+        url = f"{GRAPH_API_BASE_URL}/{phone_number_id}/messages"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to_number,
+            "type": "interactive",
+            "interactive": {
+                "type": "button",
+                "body": {"text": body_text},
+                "action": {
+                    "buttons": api_buttons,
+                },
+            },
+        }
+
+        try:
+            with httpx.Client(timeout=15.0) as client:
+                res = execute_with_retry(
+                    lambda: client.post(url, headers=headers, json=payload),
+                    max_retries=3,
+                    base_delay=0.5,
+                    description=f"WhatsApp Interactive Send to {to_number}",
+                )
+
+                if res and res.status_code in [200, 201]:
+                    logger.info("Successfully sent WhatsApp interactive message to %s (Status: %d)", to_number, res.status_code)
+                    return True
+                else:
+                    status_c = res.status_code if res else "None"
+                    logger.error("WhatsApp interactive send failed (Status %s)", status_c)
+                    return False
+        except Exception as e:
+            logger.exception("Exception sending WhatsApp interactive message to %s: %s", to_number, e)
+            return False
+
+    @classmethod
     def mark_message_as_read(cls, message_id: str) -> bool:
         """Mark incoming WhatsApp message as read."""
         phone_number_id = settings.WHATSAPP_PHONE_NUMBER_ID
@@ -864,9 +1060,16 @@ download_media = WhatsAppService.download_media
 validate_media_file = WhatsAppService.validate_media_file
 process_through_verification = WhatsAppService.process_through_verification
 cleanup_temp_files = WhatsAppService.cleanup_temp_files
+format_verification_result = WhatsAppService.format_verification_result
 format_verified_response = WhatsAppService.format_verified_response
 format_suspicious_response = WhatsAppService.format_suspicious_response
 format_unsigned_response = WhatsAppService.format_unsigned_response
 format_invalid_response = WhatsAppService.format_invalid_response
 format_rate_limit_response = WhatsAppService.format_rate_limit_response
+format_help_response = WhatsAppService.format_help_response
+format_proof_message = WhatsAppService.format_proof_message
+format_explainer_message = WhatsAppService.format_explainer_message
 send_whatsapp_message = WhatsAppService.send_whatsapp_message
+send_interactive_message = WhatsAppService.send_interactive_message
+
+

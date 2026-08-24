@@ -1,7 +1,14 @@
 import os
 from typing import List, Union
 from pydantic import AnyHttpUrl, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import (
+    BaseSettings,
+    DotEnvSettingsSource,
+    EnvSettingsSource,
+    InitSettingsSource,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+)
 
 
 class Settings(BaseSettings):
@@ -42,11 +49,26 @@ class Settings(BaseSettings):
     NGROK_AUTHTOKEN: str = ""
 
     model_config = SettingsConfigDict(
-        env_file=os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".env"),
+        env_file=[
+            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".env"),
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"),
+            ".env",
+        ],
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=True,
     )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        return (init_settings, dotenv_settings, env_settings, file_secret_settings)
 
 
 settings = Settings()
