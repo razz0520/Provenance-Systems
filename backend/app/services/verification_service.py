@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import uuid
 
 from fastapi import UploadFile
-from sqlalchemy import select
+from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from app.core.hash_service import (
@@ -135,9 +135,31 @@ class VerificationService:
             submitted_phash = cls._compute_submitted_perceptual_hash(temp_file_path, ext)
 
             # Step 3: Check Exact SHA-256 Match
-            matched_content = db.execute(
-                select(RegisteredContent).where(RegisteredContent.sha256_hash == submitted_hash)
-            ).scalar_one_or_none()
+            matching_records = db.execute(
+                select(RegisteredContent)
+                .where(RegisteredContent.sha256_hash == submitted_hash)
+                .order_by(desc(RegisteredContent.created_at), desc(RegisteredContent.id))
+            ).scalars().all()
+
+            matched_content: Optional[RegisteredContent] = None
+            if matching_records:
+                # Deterministic selection priority:
+                # 1. Newest ACTIVE registration wins (authoritative re-registration)
+                # 2. Newest SUPERSEDED registration
+                # 3. Newest REVOKED registration
+                active_matches = [r for r in matching_records if r.status == ContentStatus.ACTIVE]
+                if active_matches:
+                    matched_content = active_matches[0]
+                else:
+                    superseded_matches = [r for r in matching_records if r.status == ContentStatus.SUPERSEDED]
+                    if superseded_matches:
+                        matched_content = superseded_matches[0]
+                    else:
+                        revoked_matches = [r for r in matching_records if r.status == ContentStatus.REVOKED]
+                        if revoked_matches:
+                            matched_content = revoked_matches[0]
+                        else:
+                            matched_content = matching_records[0]
 
             evidence_bundle: Dict[str, Any] = {
                 "match_type": "NONE",

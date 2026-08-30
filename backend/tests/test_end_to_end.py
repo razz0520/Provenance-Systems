@@ -586,6 +586,78 @@ class TestProvenanceEndToEndCases:
         ev_tamp = ver_tampered_data["evidence_bundle"]
         assert ev_tamp.get("signature_valid") is False or ver_tampered_data["verdict"] in ["PROVEN_INVALID", "SUSPICIOUS", "UNSIGNED", "VERIFIED"]
 
+    def test_re_registration_after_revocation_e2e(self, client: TestClient, db: Session):
+        """Test that registering the same file again after revocation makes the new ACTIVE record authoritative."""
+        # 1. Register Publisher
+        pub_email = f"pib_rereg_{uuid.uuid4().hex[:6]}@gov.in"
+        pub_password = "SecurePassword#2026!"
+        reg_user_res = client.post(
+            "/api/v1/auth/register",
+            json={
+                "email": pub_email,
+                "password": pub_password,
+                "organization_name": "Press Information Bureau",
+                "organization_domain": "gov.in",
+            },
+        )
+        assert reg_user_res.status_code == 201
+
+        # Login
+        login_res = client.post(
+            "/api/v1/auth/login",
+            json={"email": pub_email, "password": pub_password},
+        )
+        token = login_res.json()["access_token"]
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # 2. Register initial file -> ACTIVE
+        sample_image = generate_sample_image(f"OFFICIAL RELEASE {uuid.uuid4().hex}")
+        res_reg1 = client.post(
+            "/api/v1/content/register",
+            files={"file": ("official_notice.png", sample_image, "image/png")},
+            headers=headers,
+        )
+        assert res_reg1.status_code == 201
+        content_id_1 = res_reg1.json()["content_id"]
+
+        # Initial verify -> VERIFIED
+        res_v1 = client.post("/api/v1/verify", files={"file": ("official_notice.png", sample_image, "image/png")})
+        assert res_v1.status_code == 200
+        assert res_v1.json()["verdict"] == "VERIFIED"
+
+        # 3. Revoke original content -> ContentStatus.REVOKED
+        c1_uuid = uuid.UUID(str(content_id_1))
+        rec1 = db.execute(select(RegisteredContent).where(RegisteredContent.id == c1_uuid)).scalar_one_or_none()
+        assert rec1 is not None
+        rec1.status = ContentStatus.REVOKED
+        db.commit()
+
+        # 4. Verify when only REVOKED record exists -> PROVEN_INVALID
+        res_v_revoked = client.post("/api/v1/verify", files={"file": ("official_notice.png", sample_image, "image/png")})
+        assert res_v_revoked.status_code == 200
+        assert res_v_revoked.json()["verdict"] == "PROVEN_INVALID"
+
+        # 5. Re-register exact same binary file -> creates new ACTIVE record with identical SHA-256
+        res_reg2 = client.post(
+            "/api/v1/content/register",
+            files={"file": ("official_notice.png", sample_image, "image/png")},
+            headers=headers,
+        )
+        assert res_reg2.status_code == 201
+        content_id_2 = res_reg2.json()["content_id"]
+        assert content_id_2 != content_id_1
+
+        # 6. Verify exact same binary file -> new ACTIVE record wins -> VERIFIED (no MultipleResultsFound)
+        res_v_active = client.post("/api/v1/verify", files={"file": ("official_notice.png", sample_image, "image/png")})
+        assert res_v_active.status_code == 200
+        data_v_active = res_v_active.json()
+        assert data_v_active["verdict"] == "VERIFIED"
+        assert data_v_active["confidence_score"] == 1.0
+        assert data_v_active["evidence_bundle"]["sha256_match"] is True
+        assert data_v_active["evidence_bundle"]["signature_valid"] is True
+        assert data_v_active["matched_content"]["id"] == content_id_2
+
+
 
 # ============================================================================
 # 4. PERFORMANCE TESTS
