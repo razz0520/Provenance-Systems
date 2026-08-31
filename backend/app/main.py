@@ -19,13 +19,28 @@ from fastapi.staticfiles import StaticFiles
 from app.api.v1 import api_v1_router
 from app.api.v1.system import router as system_router
 from app.config import settings
-from app.database import init_db
-
-# Configure structured logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s (%(filename)s:%(lineno)d): %(message)s",
+from app.core.context import (
+    RequestIdFilter,
+    get_current_request_id,
+    set_current_request_id,
 )
+from app.core.timeout import ProcessingTimeoutError
+from app.database import init_db
+from sqlalchemy.exc import SQLAlchemyError
+
+# Configure structured logging with RequestIdFilter
+log_filter = RequestIdFilter()
+log_handler = logging.StreamHandler()
+log_handler.addFilter(log_filter)
+log_formatter = logging.Formatter(
+    "%(asctime)s [%(levelname)s] [%(request_id)s] %(name)s (%(filename)s:%(lineno)d): %(message)s"
+)
+log_handler.setFormatter(log_formatter)
+
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+root_logger.handlers = [log_handler]
+
 logger = logging.getLogger("provenance.app")
 
 
@@ -87,7 +102,8 @@ app.add_middleware(
 @app.middleware("http")
 async def security_and_timing_middleware(request: Request, call_next):
     """Inject request ID, track processing latency, and enforce security headers."""
-    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+    raw_req_id = request.headers.get("X-Request-ID")
+    request_id = set_current_request_id(raw_req_id)
     start_time = time.perf_counter()
 
     # Process request
@@ -102,17 +118,18 @@ async def security_and_timing_middleware(request: Request, call_next):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
     response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     response.headers["Content-Security-Policy"] = "default-src 'self'; frame-ancestors 'none';"
 
-    # Log request summary
+    # Log request summary with correlation ID
     logger.info(
-        "%s %s -> %d (Time: %sms, ReqID: %s)",
+        "%s %s -> %d (Time: %sms)",
         request.method,
         request.url.path,
         response.status_code,
         process_time_ms,
-        request_id,
     )
 
     return response
@@ -124,7 +141,8 @@ async def security_and_timing_middleware(request: Request, call_next):
 
 @app.exception_handler(HTTPException)
 async def custom_http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
-    """Format HTTP exceptions into standard error envelope."""
+    """Format HTTP exceptions into standard error envelope with request ID."""
+    req_id = get_current_request_id()
     return JSONResponse(
         status_code=exc.status_code,
         content={
@@ -132,6 +150,7 @@ async def custom_http_exception_handler(request: Request, exc: HTTPException) ->
             "status_code": exc.status_code,
             "message": exc.detail,
             "path": request.url.path,
+            "request_id": req_id,
         },
         headers=exc.headers,
     )
@@ -139,7 +158,8 @@ async def custom_http_exception_handler(request: Request, exc: HTTPException) ->
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
-    """Format Pydantic validation errors."""
+    """Format Pydantic validation errors with request ID."""
+    req_id = get_current_request_id()
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
@@ -148,13 +168,15 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             "message": "Request validation failed",
             "details": exc.errors(),
             "path": request.url.path,
+            "request_id": req_id,
         },
     )
 
 
 @app.exception_handler(ValueError)
 async def value_error_exception_handler(request: Request, exc: ValueError) -> JSONResponse:
-    """Handle ValueErrors as Bad Request 400."""
+    """Handle ValueErrors as Bad Request 400 with request ID."""
+    req_id = get_current_request_id()
     return JSONResponse(
         status_code=status.HTTP_400_BAD_REQUEST,
         content={
@@ -162,13 +184,49 @@ async def value_error_exception_handler(request: Request, exc: ValueError) -> JS
             "status_code": 400,
             "message": str(exc),
             "path": request.url.path,
+            "request_id": req_id,
+        },
+    )
+
+
+@app.exception_handler(ProcessingTimeoutError)
+async def processing_timeout_exception_handler(request: Request, exc: ProcessingTimeoutError) -> JSONResponse:
+    """Handle media processing timeouts safely with HTTP 408 without returning 500."""
+    req_id = get_current_request_id()
+    logger.warning("Media processing timed out on %s: %s", request.url.path, exc)
+    return JSONResponse(
+        status_code=status.HTTP_408_REQUEST_TIMEOUT,
+        content={
+            "error": True,
+            "status_code": 408,
+            "message": str(exc),
+            "path": request.url.path,
+            "request_id": req_id,
+        },
+    )
+
+
+@app.exception_handler(SQLAlchemyError)
+async def database_exception_handler(request: Request, exc: SQLAlchemyError) -> JSONResponse:
+    """Handle database errors safely without exposing connection strings or credentials."""
+    req_id = get_current_request_id()
+    logger.error("Database operation error on %s: %s", request.url.path, exc)
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={
+            "error": True,
+            "status_code": 503,
+            "message": "A database service error occurred. Please try again.",
+            "path": request.url.path,
+            "request_id": req_id,
         },
     )
 
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-    """Fallback handler for unhandled internal server errors."""
+    """Fallback handler for unhandled internal server errors without leaking internals."""
+    req_id = get_current_request_id()
     logger.exception("Unhandled server exception at %s: %s", request.url.path, exc)
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -177,6 +235,7 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
             "status_code": 500,
             "message": "An internal server error occurred.",
             "path": request.url.path,
+            "request_id": req_id,
         },
     )
 

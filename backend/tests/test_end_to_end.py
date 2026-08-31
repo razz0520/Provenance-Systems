@@ -253,6 +253,27 @@ class TestPerceptualHashing:
         assert res_unrel["verdict"] == VerificationVerdict.UNSIGNED.value
         assert res_unrel["evidence_bundle"]["match_type"] == "NONE"
 
+        # 5. Re-encoded / Compressed video (identical visual content, different binary/SHA-256) -> VERIFIED via Perceptual
+        reencoded_path = str(tmp_path / "reencoded_video.mp4")
+        out_reenc = cv2.VideoWriter(reencoded_path, fourcc, 10.0, (120, 120))
+        for i in range(30):
+            frame = np.zeros((120, 120, 3), dtype=np.uint8)
+            cv2.circle(frame, (30 + i * 2, 60), 20, (255, 200, 50), -1)
+            out_reenc.write(frame)
+        out_reenc.release()
+
+        res_reenc = verify_file(db=db, upload_file=reencoded_path, filename="reencoded_broadcast.mp4")
+        assert res_reenc["verdict"] == VerificationVerdict.VERIFIED.value
+
+        # 6. Credential Revocation after Perceptual Match -> PROVEN_INVALID
+        cred = user.credentials[0]
+        cred.status = CredentialStatus.REVOKED
+        db.commit()
+
+        res_rev_mod = verify_file(db=db, upload_file=mod_video_path, filename="forwarded_broadcast.mp4")
+        assert res_rev_mod["verdict"] == VerificationVerdict.PROVEN_INVALID.value
+        assert "revoked" in res_rev_mod["evidence_bundle"]["notice"].lower()
+
 
 class TestHashChainLedger:
     """Unit tests for the tamper-evident hash-chain ledger."""
@@ -555,10 +576,19 @@ class TestProvenanceEndToEndCases:
         cred = db.execute(select(Credential).where(Credential.publisher_id == pub_uid)).scalar_one_or_none()
         assert cred is not None
 
-        revoke_res = client.put(
+        # Publisher attempt must be forbidden (403)
+        pub_revoke_res = client.put(
             f"/api/v1/credentials/{cred.id}/revoke",
             json={"reason": "Compromised key test"},
             headers=pub_headers,
+        )
+        assert pub_revoke_res.status_code == 403
+
+        # Admin revocation succeeds (200)
+        revoke_res = client.put(
+            f"/api/v1/credentials/{cred.id}/revoke",
+            json={"reason": "Compromised key test"},
+            headers=admin_headers,
         )
         assert revoke_res.status_code == 200
         assert revoke_res.json()["status"] == "REVOKED"
@@ -566,8 +596,8 @@ class TestProvenanceEndToEndCases:
         res_ver_revoked = client.post("/api/v1/verify", files={"file": ("citizen_upload.png", registered_image_bytes, "image/png")})
         assert res_ver_revoked.status_code == 200
         ver_revoked_data = res_ver_revoked.json()
-        ev_rev = ver_revoked_data["evidence_bundle"]
-        assert ev_rev.get("signature_valid") is False or ev_rev.get("credential_status") == "REVOKED" or ver_revoked_data["verdict"] in ["PROVEN_INVALID", "SUSPICIOUS", "VERIFIED"]
+        assert ver_revoked_data["verdict"] == "PROVEN_INVALID"
+        assert ver_revoked_data["confidence_score"] == 1.0
 
         # -------------------------------------------------------------
         # 8. Tamper with registry -> PROVEN_INVALID / Broken Signature

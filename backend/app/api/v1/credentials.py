@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, get_db, require_publisher
+from app.api.deps import get_current_user, get_db, require_admin, require_publisher
 from app.models.database import (
     AuditLog,
     Credential,
@@ -23,6 +23,7 @@ from app.schemas import (
     CredentialResponse,
     RevokeCredentialRequest,
 )
+from app.services.whatsapp_service import clear_verification_cache
 
 logger = logging.getLogger(__name__)
 
@@ -101,23 +102,20 @@ def create_credential(
 @router.put(
     "/{id}/revoke",
     response_model=CredentialResponse,
-    summary="Revoke a publisher credential",
+    summary="Revoke a publisher credential (Admin only)",
 )
 def revoke_credential(
     id: str,
     payload: RevokeCredentialRequest,
-    current_user: User = Depends(require_publisher),
+    current_user: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> Any:
-    """Permanently revoke a publisher credential."""
+    """Permanently revoke a publisher credential. Admin authorization required."""
     cid = uuid.UUID(id)
     cred = db.execute(select(Credential).where(Credential.id == cid)).scalar_one_or_none()
 
     if not cred:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Credential not found")
-
-    if current_user.role != UserRole.ADMIN and cred.publisher_id != current_user.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized")
 
     cred.status = CredentialStatus.REVOKED
     cred.revoked_at = datetime.now(timezone.utc)
@@ -132,28 +130,29 @@ def revoke_credential(
     db.commit()
     db.refresh(cred)
 
+    # Invalidate cached verifications to prevent stale trust verdicts
+    clear_verification_cache()
+
+    logger.info("Admin %s revoked credential %s (Reason: %s)", current_user.email, cred.id, payload.reason)
     return cred.to_dict()
 
 
 @router.put(
     "/{id}/suspend",
     response_model=CredentialResponse,
-    summary="Suspend a publisher credential",
+    summary="Suspend a publisher credential (Admin only)",
 )
 def suspend_credential(
     id: str,
-    current_user: User = Depends(require_publisher),
+    current_user: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> Any:
-    """Temporarily suspend a publisher credential."""
+    """Temporarily suspend a publisher credential. Admin authorization required."""
     cid = uuid.UUID(id)
     cred = db.execute(select(Credential).where(Credential.id == cid)).scalar_one_or_none()
 
     if not cred:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Credential not found")
-
-    if current_user.role != UserRole.ADMIN and cred.publisher_id != current_user.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized")
 
     cred.status = CredentialStatus.SUSPENDED
 
@@ -166,4 +165,8 @@ def suspend_credential(
     db.commit()
     db.refresh(cred)
 
+    # Invalidate cached verifications to prevent stale trust verdicts
+    clear_verification_cache()
+
+    logger.info("Admin %s suspended credential %s", current_user.email, cred.id)
     return cred.to_dict()

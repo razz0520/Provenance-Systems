@@ -11,7 +11,8 @@ import io
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+import re
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import uuid
 
 import cv2
@@ -116,20 +117,37 @@ verify_file_hash = SHA256Service.verify_file_hash
 # 2. Perceptual Hash Service (Image, Video, Audio)
 # ============================================================================
 
+# Prevent PIL decompression bombs (cap at 50 megapixels)
+Image.MAX_IMAGE_PIXELS = 50_000_000
+
+
 def _load_pil_image(image_input: Union[str, Path, bytes, Image.Image]) -> Image.Image:
-    """Helper to convert various image input formats to a PIL Image."""
+    """Helper to convert various image input formats to a PIL Image with size capping."""
+    img: Image.Image
     if isinstance(image_input, Image.Image):
-        return image_input.convert("RGB")
-    if isinstance(image_input, (str, Path)):
-        return Image.open(str(image_input)).convert("RGB")
-    if isinstance(image_input, (bytes, bytearray)):
-        return Image.open(io.BytesIO(image_input)).convert("RGB")
-    raise ValueError(f"Unsupported image input type: {type(image_input)}")
+        img = image_input.convert("RGB")
+    elif isinstance(image_input, (str, Path)):
+        img = Image.open(str(image_input)).convert("RGB")
+    elif isinstance(image_input, (bytes, bytearray)):
+        img = Image.open(io.BytesIO(image_input)).convert("RGB")
+    else:
+        raise ValueError(f"Unsupported image input type: {type(image_input)}")
+
+    # Defensive dimension capping: resize if larger than 4096 in either dimension
+    if img.width > 4096 or img.height > 4096:
+        img.thumbnail((4096, 4096), Image.Resampling.LANCZOS)
+
+    return img
 
 
 def _hash_single_frame(args: Tuple[int, float, np.ndarray]) -> Dict[str, Any]:
-    """Helper for parallel frame hash extraction."""
+    """Helper for parallel frame hash extraction with bounded frame size."""
     frame_idx, timestamp_s, frame_rgb = args
+    # Defensive frame resolution cap
+    h, w = frame_rgb.shape[:2]
+    if w > 2048 or h > 2048:
+        frame_rgb = cv2.resize(frame_rgb, (min(w, 2048), min(h, 2048)), interpolation=cv2.INTER_AREA)
+
     pil_img = Image.fromarray(frame_rgb)
     return {
         "frame_index": frame_idx,
@@ -190,7 +208,7 @@ class PerceptualHashService:
     ) -> Dict[str, Any]:
         """
         Generate perceptual frame hashes for a video at regular intervals.
-        Uses multi-threaded hashing for fast frame processing.
+        Uses multi-threaded hashing for fast frame processing with defensive limits.
 
         Args:
             video_path: Path to the video file.
@@ -212,6 +230,10 @@ class PerceptualHashService:
             video_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             duration_s = total_frames / video_fps if video_fps > 0 else 0.0
+
+            # Guard against pathological video duration (max 10 minutes)
+            if duration_s > 600.0:
+                raise ValueError(f"Video duration ({round(duration_s, 1)}s) exceeds maximum allowed limit of 600 seconds.")
 
             sample_step = max(1, int(round(video_fps / fps))) if fps > 0 else int(video_fps)
 
@@ -251,13 +273,14 @@ class PerceptualHashService:
             cap.release()
 
     @staticmethod
-    def generate_audio_fingerprint(audio_path: Union[str, Path, bytes]) -> str:
+    def generate_audio_fingerprint(audio_path: Union[str, Path, bytes], max_duration_s: float = 300.0) -> str:
         """
-        Generate an acoustic fingerprint for an audio file using librosa.
+        Generate an acoustic fingerprint for an audio file using librosa with bounded duration.
         Extracts chroma and MFCC feature signatures robust against compression.
 
         Args:
             audio_path: File path or raw audio bytes.
+            max_duration_s: Maximum duration to process in seconds (default 300s).
 
         Returns:
             Hexadecimal acoustic fingerprint string.
@@ -271,8 +294,12 @@ class PerceptualHashService:
                 y, sr = sf.read(audio_io)
                 if y.ndim > 1:
                     y = np.mean(y, axis=1)
+                # Cap duration
+                max_samples = int(sr * max_duration_s)
+                if len(y) > max_samples:
+                    y = y[:max_samples]
             else:
-                y, sr = librosa.load(str(audio_path), sr=22050, mono=True)
+                y, sr = librosa.load(str(audio_path), sr=22050, mono=True, duration=max_duration_s)
 
             if len(y) == 0:
                 return "0" * 64
@@ -370,13 +397,229 @@ class PerceptualHashService:
             logger.warning("Error comparing perceptual hashes: %s", e)
             return 0.0
 
+    @staticmethod
+    def generate_pdf_fingerprint(
+        pdf_path_or_bytes: Union[str, Path, bytes, bytearray, io.BytesIO],
+        max_pages: int = 50,
+        max_chars: int = 50000,
+    ) -> Dict[str, Any]:
+        """
+        Generate a compact, deterministic multi-signal fingerprint for a PDF document.
+        Extracts structural counts, normalized text hash, key reference identifiers,
+        word shingles for sequence similarity, and page image perceptual hashes if available.
+        """
+        pdf_stream = None
+        should_close = False
+        try:
+            import pypdf
+
+            if isinstance(pdf_path_or_bytes, (bytes, bytearray)):
+                pdf_stream = io.BytesIO(pdf_path_or_bytes)
+            elif isinstance(pdf_path_or_bytes, io.BytesIO):
+                pdf_stream = pdf_path_or_bytes
+            else:
+                p = Path(pdf_path_or_bytes)
+                if not p.is_file():
+                    raise FileNotFoundError(f"PDF file not found: {pdf_path_or_bytes}")
+                pdf_stream = open(str(p), "rb")
+                should_close = True
+
+            reader = pypdf.PdfReader(pdf_stream)
+            total_pages = len(reader.pages)
+            pages_to_process = min(total_pages, max_pages)
+
+            extracted_text_chunks: List[str] = []
+            current_chars = 0
+            page_visual_phash: Optional[str] = None
+            page_visual_dhash: Optional[str] = None
+
+            for i in range(pages_to_process):
+                page = reader.pages[i]
+                try:
+                    p_txt = page.extract_text() or ""
+                except Exception:
+                    p_txt = ""
+
+                if p_txt and current_chars < max_chars:
+                    needed = max_chars - current_chars
+                    chunk = p_txt[:needed]
+                    extracted_text_chunks.append(chunk)
+                    current_chars += len(chunk)
+
+                # If first page and has images, extract primary visual hash for scanned PDFs
+                if i == 0 and not page_visual_phash and getattr(page, "images", None):
+                    try:
+                        if len(page.images) > 0:
+                            img_data = page.images[0].data
+                            page_visual_phash = PerceptualHashService.generate_image_phash(img_data)
+                            page_visual_dhash = PerceptualHashService.generate_image_dhash(img_data)
+                    except Exception:
+                        pass
+
+            combined_text = " ".join(extracted_text_chunks).strip()
+
+            # Text normalization (lowercase, collapse whitespace, strip special noise)
+            clean_text = re.sub(r"\s+", " ", combined_text).strip().lower()
+            normalized_text_hash = hashlib.sha256(clean_text.encode("utf-8")).hexdigest() if clean_text else ""
+
+            # Extract distinct reference tokens (e.g., notification numbers, reference IDs, years)
+            ref_tokens: Set[str] = set()
+            if clean_text:
+                matches = re.findall(
+                    r"\b(?:(?:notification|ref|no|f\.no|order|gazette|g\.s\.r)[\s\.:\/\-_]+)+([a-z0-9\/\-_]{2,30})\b",
+                    clean_text,
+                )
+                stop_words = {"no", "ref", "notification", "order", "gazette", "f", "section", "act", "rule", "circular", "to", "the", "of", "and"}
+                for m in matches:
+                    cleaned = m.strip("/.-_")
+                    if cleaned and cleaned not in stop_words:
+                        ref_tokens.add(cleaned)
+
+                # General reference number patterns like 101/2026, 999999/2026
+                ref_nums = re.findall(r"\b(\d{1,6}\/20[2-3][0-9])\b", clean_text)
+                for rn in ref_nums:
+                    ref_tokens.add(rn)
+
+                years = re.findall(r"\b(20[2-3][0-9])\b", clean_text)
+                for y in years:
+                    ref_tokens.add(f"year_{y}")
+
+            words = clean_text.split()
+            word_count = len(words)
+            distinctive_words = [hashlib.md5(w.encode("utf-8")).hexdigest()[:6] for w in words[:100]]
+
+            # Generate rolling word shingles (3-word n-grams) capped at 100
+            shingle_hashes: List[str] = []
+            if len(words) >= 3:
+                for j in range(min(len(words) - 2, 200)):
+                    shingle = f"{words[j]}_{words[j+1]}_{words[j+2]}"
+                    h = hashlib.md5(shingle.encode("utf-8")).hexdigest()[:8]
+                    if h not in shingle_hashes:
+                        shingle_hashes.append(h)
+                        if len(shingle_hashes) >= 100:
+                            break
+            elif len(words) > 0:
+                shingle_hashes = [hashlib.md5(clean_text.encode("utf-8")).hexdigest()[:8]]
+
+            return {
+                "media_type": "PDF",
+                "status": "AVAILABLE",
+                "fingerprint_version": 1,
+                "page_count": total_pages,
+                "word_count": word_count,
+                "char_count": len(clean_text),
+                "normalized_text_hash": normalized_text_hash,
+                "reference_tokens": sorted(list(ref_tokens))[:20],
+                "distinctive_words": distinctive_words[:100],
+                "shingle_hashes": shingle_hashes[:100],
+                "page_visual_phash": page_visual_phash,
+                "page_visual_dhash": page_visual_dhash,
+            }
+        except Exception as e:
+            logger.warning("Error generating PDF fingerprint: %s", e)
+            return {
+                "media_type": "PDF",
+                "status": "FAILED",
+                "error": str(e),
+            }
+        finally:
+            if should_close and pdf_stream:
+                try:
+                    pdf_stream.close()
+                except Exception:
+                    pass
+
+    @classmethod
+    def compare_pdf_fingerprints(
+        cls,
+        fp1: Dict[str, Any],
+        fp2: Dict[str, Any],
+    ) -> float:
+        """
+        Compare two PDF fingerprints and return a similarity score from 0.0 to 100.0.
+        Uses shingle Jaccard overlap, exact normalized hash match, reference token preservation,
+        and visual fallback for scanned PDFs.
+        """
+        try:
+            if not isinstance(fp1, dict) or not isinstance(fp2, dict):
+                return 0.0
+            if fp1.get("status") != "AVAILABLE" or fp2.get("status") != "AVAILABLE":
+                return 0.0
+
+            # 1. Exact normalized text match (e.g. re-exported / re-saved identical text content)
+            h1 = fp1.get("normalized_text_hash")
+            h2 = fp2.get("normalized_text_hash")
+            if h1 and h2 and h1 == h2 and fp1.get("word_count", 0) > 0:
+                return 100.0
+
+            # 2. Text Shingle & Word Overlap
+            s1 = set(fp1.get("shingle_hashes", []))
+            s2 = set(fp2.get("shingle_hashes", []))
+            w1 = set(fp1.get("distinctive_words", []))
+            w2 = set(fp2.get("distinctive_words", []))
+
+            text_score = 0.0
+            shingle_dice = (2.0 * len(s1 & s2)) / (len(s1) + len(s2)) if (s1 and s2 and (len(s1) + len(s2)) > 0) else 0.0
+            word_dice = (2.0 * len(w1 & w2)) / (len(w1) + len(w2)) if (w1 and w2 and (len(w1) + len(w2)) > 0) else 0.0
+
+            if shingle_dice > 0 or word_dice > 0:
+                text_score = max(shingle_dice, (shingle_dice * 0.5 + word_dice * 0.5)) * 100.0
+
+            # 3. Visual Page Fallback (for scanned / image-only PDFs)
+            visual_score = 0.0
+            vp1 = fp1.get("page_visual_phash")
+            vp2 = fp2.get("page_visual_phash")
+            vd1 = fp1.get("page_visual_dhash")
+            vd2 = fp2.get("page_visual_dhash")
+            if vp1 and vp2:
+                sp = cls.compare_perceptual_hashes(vp1, vp2)
+                sd = cls.compare_perceptual_hashes(vd1, vd2) if (vd1 and vd2) else sp
+                visual_score = (sp * 0.6) + (sd * 0.4)
+
+            # Combined base score
+            base_score = max(text_score, visual_score)
+            if base_score < 50.0:
+                return round(base_score, 2)
+
+            # 4. False-Positive Protection: Reference Tokens & Dates Check
+            ref1 = set(fp1.get("reference_tokens", []))
+            ref2 = set(fp2.get("reference_tokens", []))
+
+            if ref1 and ref2:
+                # Check for explicit year conflicts (e.g. year_2026 vs year_2027)
+                years1 = {t for t in ref1 if t.startswith("year_")}
+                years2 = {t for t in ref2 if t.startswith("year_")}
+                if years1 and years2 and not (years1 & years2):
+                    # Conflicting publication year -> heavily penalize to prevent false positive
+                    base_score = max(0.0, base_score - 40.0)
+
+                # If there are distinct reference identifiers and 0 overlap
+                non_year_1 = {t for t in ref1 if not t.startswith("year_")}
+                non_year_2 = {t for t in ref2 if not t.startswith("year_")}
+                if non_year_1 and non_year_2 and not (non_year_1 & non_year_2):
+                    # Distinct notification numbers -> penalize
+                    base_score = max(0.0, base_score - 35.0)
+
+            # 5. Page count disparity penalty
+            p1 = fp1.get("page_count", 1)
+            p2 = fp2.get("page_count", 1)
+            if p1 > 0 and p2 > 0 and abs(p1 - p2) > max(1, int(0.5 * max(p1, p2))):
+                base_score = max(0.0, base_score - 25.0)
+
+            return round(min(100.0, max(0.0, float(base_score))), 2)
+        except Exception as e:
+            logger.warning("Error comparing PDF fingerprints: %s", e)
+            return 0.0
+
 
 # Function aliases for PerceptualHashService
 generate_image_phash = PerceptualHashService.generate_image_phash
 generate_image_dhash = PerceptualHashService.generate_image_dhash
 generate_video_phash = PerceptualHashService.generate_video_phash
 generate_audio_fingerprint = PerceptualHashService.generate_audio_fingerprint
+generate_pdf_fingerprint = PerceptualHashService.generate_pdf_fingerprint
 compare_perceptual_hashes = PerceptualHashService.compare_perceptual_hashes
+compare_pdf_fingerprints = PerceptualHashService.compare_pdf_fingerprints
 
 
 # ============================================================================

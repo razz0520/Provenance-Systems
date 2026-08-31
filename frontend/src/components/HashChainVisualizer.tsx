@@ -49,11 +49,11 @@ export function HashChainVisualizer() {
             <Layers className="h-4 w-4" />
           </div>
           <div className="min-w-0">
-            <h3 className="text-xs sm:text-sm font-bold text-slate-900 dark:text-white truncate">
-              Immutable Hash Chain State
+            <h3 className="text-xs sm:text-sm font-bold text-slate-900 dark:text-white uppercase tracking-wider">
+              HASH-CHAIN LEDGER
             </h3>
             <p className="text-[11px] sm:text-xs text-slate-500 dark:text-slate-400">
-              Total Height: {chainState?.total_blocks || 0} Blocks
+              Ledger Height: <span className="font-semibold text-slate-700 dark:text-slate-200">{chainState?.total_blocks || 0} Entries</span>
             </p>
           </div>
         </div>
@@ -68,7 +68,7 @@ export function HashChainVisualizer() {
           {isValid ? (
             <>
               <CheckCircle2 className="h-3.5 w-3.5 flex-shrink-0" />
-              <span>Chain Cryptographically Verified</span>
+              <span>Chain Integrity Verified</span>
             </>
           ) : (
             <>
@@ -81,25 +81,25 @@ export function HashChainVisualizer() {
 
       {/* Visual Chain Blocks */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-1">
-        {/* Genesis Block */}
+        {/* Genesis Anchor */}
         <div className="p-3 sm:p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-750">
           <div className="flex items-center justify-between text-[10px] sm:text-[11px] font-semibold text-slate-400 uppercase tracking-wider mb-1">
-            <span>Genesis Anchor Block (#1)</span>
-            <span className="text-emerald-600 dark:text-emerald-400">Immutable</span>
+            <span>Genesis Anchor</span>
+            <span className="text-emerald-600 dark:text-emerald-400">Root Constant</span>
           </div>
-          <p className="hash-font text-[11px] sm:text-xs text-slate-700 dark:text-slate-300 truncate">
-            {chainState?.genesis_hash || "GENESIS_ANCHOR_HASH"}
+          <p className="hash-font text-[11px] sm:text-xs text-slate-700 dark:text-slate-300 truncate select-all">
+            {chainState?.genesis_hash || "0000000000000000000000000000000000000000000000000000000000000000"}
           </p>
         </div>
 
         {/* Head Block */}
         <div className="p-3 sm:p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-750">
           <div className="flex items-center justify-between text-[10px] sm:text-[11px] font-semibold text-slate-400 uppercase tracking-wider mb-1">
-            <span>Ledger Head Block (#{chainState?.total_blocks || 1})</span>
+            <span>Current Ledger Head</span>
             <span className="text-navy-700 dark:text-navy-300">Latest Signed</span>
           </div>
-          <p className="hash-font text-[11px] sm:text-xs text-slate-700 dark:text-slate-300 truncate">
-            {chainState?.latest_hash || "HEAD_BLOCK_HASH"}
+          <p className="hash-font text-[11px] sm:text-xs text-slate-700 dark:text-slate-300 truncate select-all">
+            {chainState?.latest_hash || "0000000000000000000000000000000000000000000000000000000000000000"}
           </p>
         </div>
       </div>

@@ -62,28 +62,6 @@ export default function CredentialsPage() {
     }
   };
 
-  const handleSuspend = async (id: string) => {
-    try {
-      await api.put(`/credentials/${id}/suspend`);
-      toast.success("Credential suspended.");
-      fetchCredentials();
-    } catch (err: any) {
-      toast.error("Failed to suspend credential.");
-    }
-  };
-
-  const handleRevoke = async (id: string) => {
-    const reason = prompt("Enter revocation reason:");
-    if (!reason) return;
-    try {
-      await api.put(`/credentials/${id}/revoke`, { reason });
-      toast.success("Credential revoked.");
-      fetchCredentials();
-    } catch (err: any) {
-      toast.error("Failed to revoke credential.");
-    }
-  };
-
   const copyPublicKey = () => {
     if (user?.public_key) {
       navigator.clipboard.writeText(user.public_key);
@@ -100,7 +78,7 @@ export default function CredentialsPage() {
             Cryptographic Credentials & Keys
           </h2>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-            Manage Ed25519 asymmetric keypairs and active publisher certificates
+            View Ed25519 asymmetric keypairs and active publisher certificates
           </p>
         </div>
 
@@ -168,7 +146,6 @@ export default function CredentialsPage() {
                   <th className="py-3 px-4">Valid From</th>
                   <th className="py-3 px-4">Valid Until</th>
                   <th className="py-3 px-4">Status</th>
-                  <th className="py-3 px-4 text-right">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 dark:divide-slate-800/60">
@@ -191,28 +168,6 @@ export default function CredentialsPage() {
                     </td>
                     <td className="py-3.5 px-4">
                       <Badge variant={cred.status}>{cred.status}</Badge>
-                    </td>
-                    <td className="py-3.5 px-4 text-right space-x-1 sm:space-x-2 whitespace-nowrap">
-                      {cred.status === "ACTIVE" && (
-                        <>
-                          <button
-                            onClick={() => handleSuspend(cred.id)}
-                            title="Suspend Credential"
-                            className="p-1.5 rounded-lg text-gold-600 hover:bg-gold-50 dark:hover:bg-gold-950/40"
-                            aria-label="Suspend Credential"
-                          >
-                            <PauseCircle className="h-4 w-4" />
-                          </button>
-                          <button
-                            onClick={() => handleRevoke(cred.id)}
-                            title="Revoke Credential"
-                            className="p-1.5 rounded-lg text-crimson-600 hover:bg-crimson-50 dark:hover:bg-crimson-950/40"
-                            aria-label="Revoke Credential"
-                          >
-                            <Ban className="h-4 w-4" />
-                          </button>
-                        </>
-                      )}
                     </td>
                   </tr>
                 ))}

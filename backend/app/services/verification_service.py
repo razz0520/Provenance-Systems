@@ -15,20 +15,28 @@ from fastapi import UploadFile
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
+from app.config import settings
+from app.core.context import get_current_request_id
 from app.core.hash_service import (
     calculate_bytes_hash,
     calculate_file_hash,
+    compare_pdf_fingerprints,
     compare_perceptual_hashes,
     generate_audio_fingerprint,
     generate_image_dhash,
     generate_image_phash,
+    generate_pdf_fingerprint,
     generate_video_phash,
     verify_chain,
 )
 from app.core.signature_service import validate_manifest, verify_signature
+from app.core.timeout import ProcessingTimeoutError, run_with_timeout
+from app.core.upload_validation import validate_file_payload
 from app.models.database import (
     ContentStatus,
     ContentType,
+    Credential,
+    CredentialStatus,
     RegisteredContent,
     User,
     VerificationAttempt,
@@ -43,52 +51,41 @@ class VerificationService:
 
     @classmethod
     def _compute_submitted_perceptual_hash(
-        cls, file_path: str, ext: str
+        cls,
+        file_path: str,
+        ext: str,
     ) -> Dict[str, Any]:
-        """Generate perceptual hash / fingerprint for submitted file based on extension."""
-        ext_clean = ext.lower().lstrip(".")
+        """Generate appropriate perceptual hash based on file type."""
         try:
-            if ext_clean in ["jpg", "jpeg", "png", "webp", "gif", "bmp"]:
-                ph = generate_image_phash(file_path)
-                dh = generate_image_dhash(file_path)
+            if ext in ["jpg", "jpeg", "png", "webp", "gif", "bmp"]:
                 return {
                     "algorithm": "pHash + dHash",
-                    "phash": ph,
-                    "dhash": dh,
+                    "phash": generate_image_phash(file_path),
+                    "dhash": generate_image_dhash(file_path),
                 }
-            elif ext_clean in ["mp4", "avi", "mov", "mkv", "webm"]:
+            elif ext in ["mp4", "avi", "mov", "mkv", "webm", "3gp", "flv"]:
                 return generate_video_phash(file_path, fps=2.0)
-            elif ext_clean in ["mp3", "wav", "ogg", "flac", "m4a"]:
-                afp = generate_audio_fingerprint(file_path)
+            elif ext in ["mp3", "wav", "ogg", "flac", "m4a", "aac", "wma"]:
                 return {
                     "algorithm": "MFCC + Chroma Fingerprint",
-                    "audio_fingerprint": afp,
+                    "audio_fingerprint": generate_audio_fingerprint(file_path),
                 }
-            elif ext_clean == "pdf":
-                return {
-                    "status": "NOT_APPLICABLE",
-                    "media_type": "PDF",
-                    "reason": "Perceptual hashing applies to visual and acoustic media.",
-                }
+            elif ext in ["pdf"]:
+                return generate_pdf_fingerprint(file_path)
             else:
                 return {
                     "status": "NOT_APPLICABLE",
-                    "media_type": "TEXT",
-                    "reason": "Perceptual hashing applies to visual and acoustic media.",
+                    "reason": f"Perceptual fingerprinting not applicable for .{ext} files.",
                 }
         except Exception as e:
-            logger.warning("Error computing submitted perceptual hash: %s", e)
-            return {
-                "status": "FAILED",
-                "error": str(e),
-                "reason": "Could not compute media perceptual fingerprint.",
-            }
+            logger.warning("Perceptual fingerprinting failed for submitted file %s: %s", file_path, e)
+            return {"status": "FAILED", "error": str(e)}
 
     @classmethod
     def verify_file(
         cls,
         db: Session,
-        upload_file: Union[UploadFile, bytes, str, Path],
+        upload_file: Union[UploadFile, bytes, bytearray, str, Path],
         filename: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -105,6 +102,7 @@ class VerificationService:
         start_time = time.perf_counter()
 
         temp_file_path: Optional[str] = None
+        is_temp: bool = False
         orig_name = filename or "sample.bin"
 
         if hasattr(upload_file, "file"):
@@ -116,23 +114,46 @@ class VerificationService:
                 content_bytes = upload_file.file.read()
                 tmp.write(content_bytes)
                 temp_file_path = tmp.name
+                is_temp = True
         elif isinstance(upload_file, (bytes, bytearray)):
             ext = orig_name.rsplit(".", 1)[-1].lower() if "." in orig_name else "bin"
             with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp:
                 tmp.write(upload_file)
                 temp_file_path = tmp.name
+                is_temp = True
         elif isinstance(upload_file, (str, Path)):
             temp_file_path = str(upload_file)
             ext = orig_name.rsplit(".", 1)[-1].lower() if "." in orig_name else "bin"
+            is_temp = False
         else:
             raise ValueError(f"Unsupported file type for verification: {type(upload_file)}")
 
+        req_id = get_current_request_id() or "-"
+        logger.info("[%s] File verification started: filename=%s, ext=%s", req_id, orig_name, ext)
+
         try:
+            # Defensive payload validation
+            is_valid, err_msg = validate_file_payload(temp_file_path, filename=orig_name)
+            if not is_valid:
+                raise ValueError(err_msg or "Invalid file upload payload.")
+
             # Step 1: Calculate SHA-256 of submitted file
             submitted_hash = calculate_file_hash(temp_file_path)
+            logger.info("[%s] SHA256=%s", req_id, submitted_hash)
 
-            # Step 2: Compute submitted perceptual hash
-            submitted_phash = cls._compute_submitted_perceptual_hash(temp_file_path, ext)
+            # Step 2: Compute submitted perceptual hash with timeout protection
+            submitted_phash = run_with_timeout(
+                cls._compute_submitted_perceptual_hash,
+                args=(temp_file_path, ext),
+                timeout_seconds=float(getattr(settings, "MEDIA_PROCESSING_TIMEOUT_SECONDS", 30)),
+                operation_name="perceptual_hashing",
+            )
+            logger.info(
+                "[%s] Perceptual fingerprint computed: status=%s, media_type=%s",
+                req_id,
+                submitted_phash.get("status", "AVAILABLE"),
+                submitted_phash.get("media_type", ext.upper()),
+            )
 
             # Step 3: Check Exact SHA-256 Match
             matching_records = db.execute(
@@ -240,47 +261,89 @@ class VerificationService:
                         )
                         evidence_bundle["signature_valid"] = sig_valid
 
-                # Determine verdict based on status and cryptographic integrity
-                if matched_content.status == ContentStatus.ACTIVE:
-                    if sig_valid and manifest_valid and evidence_bundle["chain_integrity"]:
+                credential = matched_content.credential
+                cred_active = bool(credential and credential.status == CredentialStatus.ACTIVE)
+                cred_revoked = bool(credential and credential.status == CredentialStatus.REVOKED)
+                cred_suspended = bool(credential and credential.status == CredentialStatus.SUSPENDED)
+
+                # Determine verdict based on status, credential revocation, and cryptographic integrity
+                if cred_revoked or matched_content.status == ContentStatus.REVOKED:
+                    verdict = VerificationVerdict.PROVEN_INVALID
+                    confidence_score = 1.0
+                    if cred_revoked:
+                        evidence_bundle["notice"] = "Publisher signing credential has been officially revoked by the government authority."
+                    else:
+                        evidence_bundle["notice"] = "Content was officially revoked by the publishing authority."
+                elif cred_suspended:
+                    verdict = VerificationVerdict.PROVEN_INVALID
+                    confidence_score = 0.90
+                    evidence_bundle["notice"] = "Publisher signing credential is currently suspended by the government authority."
+                elif matched_content.status == ContentStatus.ACTIVE:
+                    if sig_valid and manifest_valid and evidence_bundle["chain_integrity"] and cred_active:
                         verdict = VerificationVerdict.VERIFIED
                         confidence_score = 1.0
                         evidence_bundle["notice"] = "Cryptographically signed and anchored to the government provenance ledger."
-                    elif sig_valid or manifest_valid:
+                    elif (sig_valid or manifest_valid) and cred_active:
                         verdict = VerificationVerdict.VERIFIED
                         confidence_score = 0.95
                         evidence_bundle["notice"] = "Valid publisher signature detected in registry."
                     else:
                         verdict = VerificationVerdict.PROVEN_INVALID
                         confidence_score = 0.85
-                        evidence_bundle["notice"] = "Cryptographic signature validation failed for this registered content."
+                        evidence_bundle["notice"] = "Cryptographic signature validation or credential trust failed for this registered content."
                 elif matched_content.status == ContentStatus.SUPERSEDED:
-                    verdict = VerificationVerdict.VERIFIED
-                    confidence_score = 0.95
-                    evidence_bundle["notice"] = "Content is authentic but has been superseded by an updated version."
+                    if cred_active:
+                        verdict = VerificationVerdict.VERIFIED
+                        confidence_score = 0.95
+                        evidence_bundle["notice"] = "Content is authentic but has been superseded by an updated version."
+                    else:
+                        verdict = VerificationVerdict.PROVEN_INVALID
+                        confidence_score = 0.95
+                        evidence_bundle["notice"] = "Publisher signing credential for this superseded content has been revoked."
                     evidence_bundle["superseded_by_id"] = str(matched_content.superseded_by_id)
-                elif matched_content.status == ContentStatus.REVOKED:
+                else:
                     verdict = VerificationVerdict.PROVEN_INVALID
                     confidence_score = 1.0
-                    evidence_bundle["notice"] = "Content was officially revoked by the publishing authority."
+                    evidence_bundle["notice"] = "Content status is invalid or revoked in registry."
 
             else:
                 # Step 4: Perceptual Hash / Near-Duplicate Fuzzy Matching
                 if submitted_phash.get("status") != "NOT_APPLICABLE" and submitted_phash.get("status") != "FAILED":
+                    req_id = get_current_request_id() or "-"
                     perceptual_candidates = db.execute(
                         select(RegisteredContent).where(RegisteredContent.status == ContentStatus.ACTIVE)
                     ).scalars().all()
+
+                    logger.info(
+                        "[%s] Perceptual fallback check: ext=%s, candidates=%d, fingerprint_status=%s",
+                        req_id,
+                        ext,
+                        len(perceptual_candidates),
+                        submitted_phash.get("status", "OK"),
+                    )
 
                     best_match: Optional[RegisteredContent] = None
                     best_score = 0.0
 
                     for candidate in perceptual_candidates:
                         cand_phash = candidate.perceptual_hash
+
+                        # If candidate is a registered PDF with legacy/missing fingerprint, generate on-demand from stored file
+                        if candidate.content_type == ContentType.PDF and (not cand_phash or cand_phash.get("status") != "AVAILABLE"):
+                            stored_path = Path(settings.PROCESSED_DIR) / candidate.stored_filename
+                            if stored_path.exists():
+                                cand_phash = generate_pdf_fingerprint(stored_path)
+                                candidate.perceptual_hash = cand_phash
+                                try:
+                                    db.commit()
+                                except Exception:
+                                    db.rollback()
+
                         if not cand_phash or cand_phash.get("status") == "NOT_APPLICABLE":
                             continue
 
                         # Compare image hashes (combining pHash and dHash for high discrimination)
-                        if candidate.content_type == ContentType.IMAGE and ext in ["jpg", "jpeg", "png", "webp"]:
+                        if candidate.content_type == ContentType.IMAGE and ext in ["jpg", "jpeg", "png", "webp", "gif", "bmp"]:
                             try:
                                 sub_p = submitted_phash.get("phash", "")
                                 cand_p = cand_phash.get("phash", "")
@@ -290,6 +353,7 @@ class VerificationService:
                                     sim_p = compare_perceptual_hashes(sub_p, cand_p)
                                     sim_d = compare_perceptual_hashes(sub_d, cand_d) if (sub_d and cand_d) else sim_p
                                     sim = round((sim_p * 0.6) + (sim_d * 0.4), 2)
+                                    logger.info("[%s] Candidate %s (IMAGE): perceptual similarity score=%.2f (thresholds: verified>=95.0, suspicious>=70.0)", req_id, candidate.id, sim)
                                     if sim > best_score:
                                         best_score = sim
                                         best_match = candidate
@@ -297,9 +361,10 @@ class VerificationService:
                                 pass
 
                         # Compare video hashes
-                        elif candidate.content_type == ContentType.VIDEO and ext in ["mp4", "avi", "mov", "mkv"]:
+                        elif candidate.content_type == ContentType.VIDEO and ext in ["mp4", "avi", "mov", "mkv", "webm", "3gp", "flv"]:
                             try:
                                 sim = compare_perceptual_hashes(submitted_phash, cand_phash)
+                                logger.info("[%s] Candidate %s (VIDEO): perceptual similarity score=%.2f (thresholds: verified>=95.0, suspicious>=70.0)", req_id, candidate.id, sim)
                                 if sim > best_score:
                                     best_score = sim
                                     best_match = candidate
@@ -307,17 +372,36 @@ class VerificationService:
                                 pass
 
                         # Compare audio fingerprints
-                        elif candidate.content_type == ContentType.AUDIO and ext in ["mp3", "wav", "ogg", "m4a"]:
+                        elif candidate.content_type == ContentType.AUDIO and ext in ["mp3", "wav", "ogg", "flac", "m4a", "aac", "wma"]:
                             try:
                                 sub_afp = submitted_phash.get("audio_fingerprint", "")
                                 cand_afp = cand_phash.get("audio_fingerprint", "")
                                 if sub_afp and cand_afp:
                                     sim = compare_perceptual_hashes(sub_afp, cand_afp)
+                                    logger.info("[%s] Candidate %s (AUDIO): acoustic similarity score=%.2f (thresholds: verified>=95.0, suspicious>=70.0)", req_id, candidate.id, sim)
                                     if sim > best_score:
                                         best_score = sim
                                         best_match = candidate
                             except Exception:
                                 pass
+
+                        # Compare PDF document fingerprints
+                        elif candidate.content_type == ContentType.PDF and ext in ["pdf"]:
+                            try:
+                                sim = compare_pdf_fingerprints(submitted_phash, cand_phash)
+                                logger.info("[%s] Candidate %s (PDF): document similarity score=%.2f (thresholds: verified>=98.0, suspicious>=70.0)", req_id, candidate.id, sim)
+                                if sim > best_score:
+                                    best_score = sim
+                                    best_match = candidate
+                            except Exception:
+                                pass
+
+                    logger.info(
+                        "[%s] Perceptual matching result: best_match=%s, best_score=%.2f",
+                        req_id,
+                        best_match.id if best_match else "NONE",
+                        best_score,
+                    )
 
                     # Evaluate perceptual similarity thresholds
                     if best_match and best_score >= 70.0:
@@ -347,7 +431,45 @@ class VerificationService:
                                     pub_k,
                                 )
 
-                        if best_score >= 95.0:
+                        cand_cred = best_match.credential
+                        cand_cred_active = bool(cand_cred and cand_cred.status == CredentialStatus.ACTIVE)
+                        cand_cred_revoked = bool(cand_cred and cand_cred.status == CredentialStatus.REVOKED)
+                        cand_cred_suspended = bool(cand_cred and cand_cred.status == CredentialStatus.SUSPENDED)
+
+                        logger.info(
+                            "[%s] Matched candidate %s credential status: %s",
+                            req_id,
+                            best_match.id,
+                            cand_cred.status.value if cand_cred else "NONE",
+                        )
+
+                        if cand_cred_revoked or best_match.status == ContentStatus.REVOKED:
+                            verdict = VerificationVerdict.PROVEN_INVALID
+                            confidence_score = 1.0
+                            evidence_bundle["notice"] = "Publisher signing credential has been officially revoked by the government authority."
+                        elif cand_cred_suspended:
+                            verdict = VerificationVerdict.PROVEN_INVALID
+                            confidence_score = 1.0
+                            evidence_bundle["notice"] = "Publisher signing credential is currently suspended by the government authority."
+                        elif best_match.content_type == ContentType.PDF:
+                            # For PDF: evaluate whether content is identical re-export vs altered document
+                            sub_text_h = submitted_phash.get("normalized_text_hash")
+                            cand_text_h = best_match.perceptual_hash.get("normalized_text_hash") if isinstance(best_match.perceptual_hash, dict) else None
+                            if best_score >= 98.0 and cand_cred_active and sub_text_h and sub_text_h == cand_text_h and submitted_phash.get("word_count", 0) > 0:
+                                verdict = VerificationVerdict.VERIFIED
+                                confidence_score = round(best_score / 100.0, 2)
+                                evidence_bundle["notice"] = (
+                                    f"Matches authentic registered document ({best_score}% content similarity) "
+                                    f"re-exported with identical text content."
+                                )
+                            else:
+                                verdict = VerificationVerdict.SUSPICIOUS
+                                confidence_score = round(best_score / 100.0, 2)
+                                evidence_bundle["notice"] = (
+                                    f"Document shows {best_score}% similarity to official publication "
+                                    f"(ID: {best_match.id}) but has alterations/modifications."
+                                )
+                        elif best_score >= 95.0 and cand_cred_active:
                             verdict = VerificationVerdict.VERIFIED
                             confidence_score = round(best_score / 100.0, 2)
                             evidence_bundle["notice"] = (
@@ -397,11 +519,11 @@ class VerificationService:
             }
 
         finally:
-            if temp_file_path and os.path.exists(temp_file_path) and "tmp" in temp_file_path:
+            if is_temp and temp_file_path and os.path.exists(temp_file_path):
                 try:
                     os.unlink(temp_file_path)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("Failed to remove temp verification file %s: %s", temp_file_path, e)
 
     @classmethod
     def verify_text(cls, db: Session, text_content: str) -> Dict[str, Any]:

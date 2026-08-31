@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, rate_limiter
+from app.core.timeout import ProcessingTimeoutError
 from app.schemas import VerificationResponse, VerifyTextRequest
 from app.services.verification_service import (
     get_verification_result,
@@ -36,6 +37,16 @@ def verify_media_file(
     try:
         result = verify_file(db=db, upload_file=file)
         return result
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        )
+    except ProcessingTimeoutError as e:
+        raise HTTPException(
+            status_code=status.HTTP_408_REQUEST_TIMEOUT,
+            detail=str(e),
+        )
     except Exception as e:
         logger.error("Media verification failed: %s", e)
         raise HTTPException(
@@ -58,6 +69,11 @@ def verify_text_content(
     try:
         result = verify_text(db=db, text_content=payload.text)
         return result
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        )
     except Exception as e:
         logger.error("Text verification failed: %s", e)
         raise HTTPException(

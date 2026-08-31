@@ -15,6 +15,9 @@ import {
   Edit2,
   Check,
   X,
+  KeyRound,
+  Ban,
+  PauseCircle,
 } from "lucide-react";
 
 export default function AdminUsersPage() {
@@ -24,6 +27,11 @@ export default function AdminUsersPage() {
   const [searchTerm, setSearchTerm] = useState("");
   const [editingUserId, setEditingUserId] = useState<string | null>(null);
   const [selectedRole, setSelectedRole] = useState<string>("PUBLISHER");
+
+  // Admin Credential Management State
+  const [selectedUserForCreds, setSelectedUserForCreds] = useState<any | null>(null);
+  const [userCredentials, setUserCredentials] = useState<any[]>([]);
+  const [loadingCreds, setLoadingCreds] = useState(false);
 
   const fetchUsers = async () => {
     setLoading(true);
@@ -37,6 +45,50 @@ export default function AdminUsersPage() {
       toast.error("Could not fetch user directory.");
     } finally {
       setLoading(false);
+    }
+  };
+
+  const fetchUserCredentials = async (publisherId: string) => {
+    setLoadingCreds(true);
+    try {
+      const res = await api.get(`/credentials?publisher_id=${publisherId}`);
+      setUserCredentials(res.data || []);
+    } catch (err) {
+      console.error("Failed to load credentials for user", err);
+      toast.error("Could not load credentials.");
+    } finally {
+      setLoadingCreds(false);
+    }
+  };
+
+  const openCredentialManager = (u: any) => {
+    setSelectedUserForCreds(u);
+    fetchUserCredentials(u.id);
+  };
+
+  const handleAdminRevokeCredential = async (credId: string) => {
+    const reason = prompt("Enter administrative revocation reason:");
+    if (!reason) return;
+    try {
+      await api.put(`/credentials/${credId}/revoke`, { reason });
+      toast.success("Credential revoked successfully.");
+      if (selectedUserForCreds) {
+        fetchUserCredentials(selectedUserForCreds.id);
+      }
+    } catch (err: any) {
+      toast.error(err.response?.data?.message || "Failed to revoke credential.");
+    }
+  };
+
+  const handleAdminSuspendCredential = async (credId: string) => {
+    try {
+      await api.put(`/credentials/${credId}/suspend`);
+      toast.success("Credential suspended.");
+      if (selectedUserForCreds) {
+        fetchUserCredentials(selectedUserForCreds.id);
+      }
+    } catch (err: any) {
+      toast.error("Failed to suspend credential.");
     }
   };
 
@@ -190,7 +242,17 @@ export default function AdminUsersPage() {
                         {u.is_active ? "Active" : "Inactive"}
                       </span>
                     </td>
-                    <td className="py-3.5 px-4 text-right whitespace-nowrap">
+                    <td className="py-3.5 px-4 text-right whitespace-nowrap space-x-1.5">
+                      {u.role === "PUBLISHER" && (
+                        <button
+                          onClick={() => openCredentialManager(u)}
+                          title="Manage Publisher Credentials"
+                          className="p-1.5 rounded-lg text-navy-600 dark:text-navy-300 hover:bg-navy-50 dark:hover:bg-slate-800 transition-colors"
+                          aria-label="Manage Credentials"
+                        >
+                          <KeyRound className="h-4 w-4" />
+                        </button>
+                      )}
                       <button
                         onClick={() => {
                           setEditingUserId(u.id);
@@ -210,6 +272,103 @@ export default function AdminUsersPage() {
           </div>
         )}
       </div>
+
+      {/* Admin Credential Management Modal */}
+      {selectedUserForCreds && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-3.5 sm:p-4">
+          <div className="bg-white dark:bg-slate-900 rounded-2xl sm:rounded-3xl p-4 sm:p-6 md:p-8 max-w-2xl w-full border border-slate-200 dark:border-slate-800 shadow-2xl space-y-5 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="h-9 w-9 rounded-xl bg-navy-50 dark:bg-slate-800 text-navy-800 dark:text-navy-300 flex items-center justify-center">
+                  <KeyRound className="h-5 w-5" />
+                </div>
+                <div>
+                  <h3 className="text-sm sm:text-base font-bold text-slate-900 dark:text-white">
+                    Publisher Signing Credentials
+                  </h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    {selectedUserForCreds.organization_name} ({selectedUserForCreds.email})
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setSelectedUserForCreds(null)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-600 dark:hover:text-white"
+                aria-label="Close"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            {/* Credentials List */}
+            {loadingCreds ? (
+              <TableSkeleton rows={2} />
+            ) : userCredentials.length === 0 ? (
+              <div className="p-8 text-center text-slate-400 text-xs">
+                No credentials issued for this publisher.
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {userCredentials.map((cred) => (
+                  <div
+                    key={cred.id}
+                    className="p-4 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+                  >
+                    <div className="space-y-1">
+                      <div className="flex items-center gap-2">
+                        <span className="font-mono text-xs font-semibold text-slate-800 dark:text-slate-200">
+                          {cred.id.substring(0, 8)}...{cred.id.substring(cred.id.length - 6)}
+                        </span>
+                        <Badge variant={cred.status}>{cred.status}</Badge>
+                        <span className="text-[10px] uppercase font-bold text-slate-400">
+                          {cred.credential_type}
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-slate-500">
+                        Valid: {new Date(cred.valid_from).toLocaleDateString()} –{" "}
+                        {new Date(cred.valid_until).toLocaleDateString()}
+                      </p>
+                      {cred.revocation_reason && (
+                        <p className="text-[11px] text-crimson-600 dark:text-crimson-400 font-medium">
+                          Reason: {cred.revocation_reason}
+                        </p>
+                      )}
+                    </div>
+
+                    {cred.status === "ACTIVE" && (
+                      <div className="flex items-center gap-2 self-end sm:self-center">
+                        <button
+                          onClick={() => handleAdminSuspendCredential(cred.id)}
+                          className="px-3 py-1.5 rounded-lg border border-gold-300 dark:border-gold-800 text-gold-700 dark:text-gold-300 hover:bg-gold-50 dark:hover:bg-gold-950/40 text-xs font-semibold flex items-center gap-1"
+                        >
+                          <PauseCircle className="h-3.5 w-3.5" />
+                          <span>Suspend</span>
+                        </button>
+                        <button
+                          onClick={() => handleAdminRevokeCredential(cred.id)}
+                          className="px-3 py-1.5 rounded-lg bg-crimson-600 hover:bg-crimson-700 text-white text-xs font-semibold flex items-center gap-1"
+                        >
+                          <Ban className="h-3.5 w-3.5" />
+                          <span>Revoke</span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div className="flex justify-end pt-2">
+              <button
+                onClick={() => setSelectedUserForCreds(null)}
+                className="px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-700 dark:text-slate-300"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

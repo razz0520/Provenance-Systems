@@ -27,8 +27,11 @@ import httpx
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.core.context import get_current_request_id
 from app.core.hash_service import calculate_bytes_hash, calculate_file_hash
 from app.core.security import check_rate_limit, get_redis_client, increment_rate_counter
+from app.core.timeout import ProcessingTimeoutError
+from app.core.upload_validation import validate_file_payload
 from app.models.database import VerificationVerdict
 from app.services.verification_service import (
     get_verification_result,
@@ -198,17 +201,66 @@ class WhatsAppService:
         return None
 
     @classmethod
+    def clear_verification_cache(cls) -> None:
+        """Invalidate all cached WhatsApp and media verification entries in Redis and in-memory."""
+        global _in_memory_seen_messages
+        _in_memory_seen_messages.clear()
+
+        r = get_redis_client()
+        if r:
+            try:
+                # Find and delete all wa_verif_cache keys
+                keys = r.keys("wa_verif_cache:*")
+                if keys:
+                    r.delete(*keys)
+                logger.info("Cleared %d cached verification entries in Redis.", len(keys) if keys else 0)
+            except Exception as e:
+                logger.warning("Error clearing Redis verification cache: %s", e)
+
+    @classmethod
+    def validate_cached_verification(
+        cls,
+        cached_res: Optional[Dict[str, Any]],
+        db: Optional[Session],
+    ) -> Optional[Dict[str, Any]]:
+        """Ensure cached result trust is not invalidated by recent credential or content revocation."""
+        if not cached_res:
+            return None
+        if not db:
+            return cached_res
+
+        matched_id = (cached_res.get("matched_content") or {}).get("id")
+        if matched_id:
+            try:
+                from app.models.database import ContentStatus, CredentialStatus, RegisteredContent
+                cid = uuid.UUID(str(matched_id))
+                rec = db.query(RegisteredContent).filter(RegisteredContent.id == cid).first()
+                if not rec:
+                    return None
+                if rec.status == ContentStatus.REVOKED:
+                    return None
+                if rec.credential and rec.credential.status != CredentialStatus.ACTIVE:
+                    return None
+            except Exception as e:
+                logger.debug("Error validating cached verification record: %s", e)
+                return None
+
+        return cached_res
+
+    @classmethod
     def set_cached_verification(
         cls,
         cache_key: str,
         result: Dict[str, Any],
         ttl_seconds: int = 3600,
     ) -> None:
-        """Store verification result in Redis cache with TTL (1 hour)."""
+        """Store verification result in Redis cache with TTL (1 hour for matches, 60s for UNSIGNED)."""
         r = get_redis_client()
         if r:
             try:
-                r.setex(f"wa_verif_cache:{cache_key}", ttl_seconds, json.dumps(result))
+                # Do not cache UNSIGNED for long periods so newly registered content is recognized promptly
+                effective_ttl = 60 if result.get("verdict") == "UNSIGNED" else ttl_seconds
+                r.setex(f"wa_verif_cache:{cache_key}", effective_ttl, json.dumps(result))
             except Exception as e:
                 logger.debug("Redis verification cache set error: %s", e)
 
@@ -331,10 +383,10 @@ class WhatsAppService:
             try:
                 text_hash = calculate_bytes_hash(text_body.encode("utf-8"))
                 cache_key = f"text:{text_hash}"
-                cached_res = cls.get_cached_verification(cache_key)
+                cached_res = cls.validate_cached_verification(cls.get_cached_verification(cache_key), db=db)
 
                 if cached_res:
-                    logger.info("Serving text verification from cache for hash %s", text_hash)
+                    logger.info("Serving text verification from validated cache for hash %s", text_hash)
                     verif_result = cached_res
                 else:
                     verif_result = verify_text(db=db, text_content=text_body)
@@ -470,10 +522,10 @@ class WhatsAppService:
             # Step 3: Check cache by media SHA-256
             media_sha256 = calculate_file_hash(temp_file_path)
             cache_key = f"media:{media_sha256}"
-            cached_res = cls.get_cached_verification(cache_key)
+            cached_res = cls.validate_cached_verification(cls.get_cached_verification(cache_key), db=db)
 
             if cached_res:
-                logger.info("Serving media verification from cache for SHA-256 %s", media_sha256)
+                logger.info("Serving media verification from validated cache for SHA-256 %s", media_sha256)
                 verif_result = cached_res
             else:
                 # Step 4: Process through complete provenance verification pipeline
@@ -489,6 +541,10 @@ class WhatsAppService:
                 "verification_result": verif_result,
             }
 
+        except ProcessingTimeoutError as e:
+            req_id = get_current_request_id() or "-"
+            logger.warning("[%s] WhatsApp media verification timed out: %s", req_id, e)
+            return {"success": False, "error": f"Verification Timed Out: Media analysis exceeded the allowed time limit ({e.timeout_seconds:.0f}s). Please try a shorter or compressed file."}
         except Exception as e:
             logger.exception("Media verification handling error: %s", e)
             return {"success": False, "error": str(e)}
@@ -527,6 +583,7 @@ class WhatsAppService:
                 )
 
                 if not res or res.status_code != 200:
+                    cls._log_meta_api_error(res, f"fetch_media_metadata_{media_id}")
                     logger.error("Failed to fetch media metadata for %s", media_id)
                     return None
 
@@ -554,6 +611,7 @@ class WhatsAppService:
                 )
 
                 if not dl_res or dl_res.status_code != 200:
+                    cls._log_meta_api_error(dl_res, f"download_media_binary_{media_id}")
                     logger.error("Failed to download media binary payload for %s", media_id)
                     return None
 
@@ -578,22 +636,15 @@ class WhatsAppService:
 
     @classmethod
     def validate_media_file(cls, file_path: str) -> bool:
-        """Validate media file exists, is non-empty, and respects size limits."""
+        """Validate media file exists, is non-empty, and respects size and format limits."""
         if not file_path or not os.path.exists(file_path):
             return False
 
-        try:
-            file_size = os.path.getsize(file_path)
-            if file_size <= 0:
-                logger.warning("Media file is empty: %s", file_path)
-                return False
-            if file_size > settings.MAX_UPLOAD_SIZE:
-                logger.warning("Media file size %d exceeds limit %d", file_size, settings.MAX_UPLOAD_SIZE)
-                return False
-            return True
-        except Exception as e:
-            logger.error("Error validating media file %s: %s", file_path, e)
+        is_valid, err_msg = validate_file_payload(file_path)
+        if not is_valid:
+            logger.warning("Media validation failed for %s: %s", file_path, err_msg)
             return False
+        return True
 
     @classmethod
     def process_through_verification(
@@ -813,8 +864,13 @@ class WhatsAppService:
             lines.append("")
         elif perceptual_status == "SIMILAR_MATCH":
             sim = evidence.get("perceptual_similarity_score") or evidence.get("similarity_score", 0)
-            lines.append(f"• Looks and sounds like the original — {int(sim)}% match")
-            lines.append(f"  _Technical: Perceptual fingerprint similarity {sim}%_")
+            cand_ph = evidence.get("perceptual_hash_matched")
+            if isinstance(cand_ph, dict) and cand_ph.get("media_type") == "PDF":
+                lines.append(f"• Document matches a registered publication — {int(sim)}% match")
+                lines.append(f"  _Technical: PDF document similarity {sim}% (content alteration detected)_")
+            else:
+                lines.append(f"• Looks and sounds like the original — {int(sim)}% match")
+                lines.append(f"  _Technical: Perceptual fingerprint similarity {sim}%_")
             lines.append("")
 
         # 3. Ed25519 digital signature
@@ -912,6 +968,71 @@ class WhatsAppService:
             )
             return True
 
+    @classmethod
+    def _log_meta_api_error(
+        cls,
+        res: Optional[httpx.Response],
+        operation: str,
+        to_number: Optional[str] = None,
+    ) -> None:
+        """
+        Safely extract and log Meta Graph API error details without leaking tokens or PII.
+        Logs: request correlation ID, HTTP status, Meta error code, type, message, subcode, trace ID.
+        Never logs access tokens, Authorization headers, private keys, passwords, or raw payloads.
+        """
+        req_id = get_current_request_id() or "-"
+        status_code = str(res.status_code) if res is not None else "NO_RESPONSE"
+        meta_err_code = "-"
+        meta_err_subcode = "-"
+        meta_err_type = "-"
+        meta_err_msg = "-"
+        fbtrace_id = "-"
+
+        if res is not None:
+            try:
+                body = res.json()
+                if isinstance(body, dict) and "error" in body:
+                    err = body.get("error", {})
+                    meta_err_code = str(err.get("code", "-"))
+                    meta_err_subcode = str(err.get("error_subcode", "-"))
+                    meta_err_type = str(err.get("type", "-"))
+                    meta_err_msg = str(err.get("message", "-"))
+                    fbtrace_id = str(err.get("fbtrace_id", "-"))
+                else:
+                    meta_err_msg = res.text[:250]
+            except Exception:
+                meta_err_msg = res.text[:250] if hasattr(res, "text") else "-"
+
+        logger.error(
+            "[%s] Meta Graph API Error | Operation: %s | Status: %s | Code: %s | Subcode: %s | Type: %s | Message: %s | TraceID: %s",
+            req_id,
+            operation,
+            status_code,
+            meta_err_code,
+            meta_err_subcode,
+            meta_err_type,
+            meta_err_msg,
+            fbtrace_id,
+        )
+
+    @classmethod
+    def send_whatsapp_message(
+        cls,
+        to_number: str,
+        message_text: str,
+    ) -> bool:
+        """Send a standard text message via Meta WhatsApp Cloud API."""
+        phone_number_id = settings.WHATSAPP_PHONE_NUMBER_ID
+        access_token = settings.WHATSAPP_ACCESS_TOKEN
+
+        if not phone_number_id or not access_token:
+            logger.warning(
+                "WhatsApp credentials not configured. Simulating dispatch to %s:\n%s",
+                to_number,
+                message_text,
+            )
+            return True
+
         url = f"{GRAPH_API_BASE_URL}/{phone_number_id}/messages"
         headers = {
             "Authorization": f"Bearer {access_token}",
@@ -941,8 +1062,7 @@ class WhatsAppService:
                     logger.info("Successfully sent WhatsApp message to %s (Status: %d)", to_number, res.status_code)
                     return True
                 else:
-                    status_c = res.status_code if res else "None"
-                    logger.error("WhatsApp send failed (Status %s)", status_c)
+                    cls._log_meta_api_error(res, "send_whatsapp_message", to_number=to_number)
                     return False
         except Exception as e:
             logger.exception("Exception sending WhatsApp message to %s: %s", to_number, e)
@@ -1010,8 +1130,7 @@ class WhatsAppService:
                     logger.info("Successfully sent WhatsApp interactive message to %s (Status: %d)", to_number, res.status_code)
                     return True
                 else:
-                    status_c = res.status_code if res else "None"
-                    logger.error("WhatsApp interactive send failed (Status %s)", status_c)
+                    cls._log_meta_api_error(res, "send_interactive_message", to_number=to_number)
                     return False
         except Exception as e:
             logger.exception("Exception sending WhatsApp interactive message to %s: %s", to_number, e)
@@ -1045,7 +1164,11 @@ class WhatsAppService:
                     base_delay=0.5,
                     description=f"Mark Read [ID: {message_id}]",
                 )
-                return bool(res and res.status_code in [200, 201])
+                if res and res.status_code in [200, 201]:
+                    return True
+                else:
+                    cls._log_meta_api_error(res, f"mark_message_as_read_{message_id}")
+                    return False
         except Exception as e:
             logger.debug("Failed to mark message %s as read: %s", message_id, e)
             return False
@@ -1071,5 +1194,6 @@ format_proof_message = WhatsAppService.format_proof_message
 format_explainer_message = WhatsAppService.format_explainer_message
 send_whatsapp_message = WhatsAppService.send_whatsapp_message
 send_interactive_message = WhatsAppService.send_interactive_message
+clear_verification_cache = WhatsAppService.clear_verification_cache
 
 

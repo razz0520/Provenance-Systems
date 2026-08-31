@@ -1036,6 +1036,36 @@ def test_redis_verification_caching(db: Session):
         assert res2.get("verdict") == "UNSIGNED"
 
 
+def test_cache_invalidation_on_content_registration(db: Session, tmp_path):
+    """Test that registering new content flushes stale verification caches."""
+    # 1. Register publisher
+    email = f"cache_pub_{uuid.uuid4().hex[:6]}@gov.in"
+    user = register_publisher(
+        db=db,
+        email=email,
+        password="Password123!",
+        organization_name="Ministry of Health",
+        organization_domain="mohfw.gov.in",
+    )
+
+    # 2. Simulate caching of an unknown media hash
+    dummy_sha256 = f"abc{uuid.uuid4().hex[:61]}"
+    cache_key = f"media:{dummy_sha256}"
+    WhatsAppService.set_cached_verification(
+        cache_key=cache_key,
+        result={"verdict": "UNSIGNED", "matched_content": None},
+    )
+    assert WhatsAppService.get_cached_verification(cache_key) is not None
+
+    # 3. Register a new image content
+    img_bytes = generate_distinct_image()
+    upload = UploadFile(filename="official_advisory.png", file=io.BytesIO(img_bytes))
+    register_content(db=db, publisher=user, upload_file=upload)
+
+    # 4. Cache should have been invalidated by register_content
+    assert WhatsAppService.get_cached_verification(cache_key) is None
+
+
 def test_async_webhook_post_endpoint(client):
     """Test POST /api/v1/webhook/whatsapp immediately returns 200 and triggers background processing."""
     payload = {

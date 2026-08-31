@@ -36,6 +36,7 @@ class Settings(BaseSettings):
 
     # File Storage & Limits
     MAX_UPLOAD_SIZE: int = 16777216  # 16 MB
+    MEDIA_PROCESSING_TIMEOUT_SECONDS: int = 120  # Generous safety ceiling (2 mins) for media processing
     ALLOWED_EXTENSIONS: str = "mp4,avi,mov,mp3,wav,jpg,png,pdf,txt"
     UPLOAD_DIR: str = "uploads"
     TEMP_DIR: str = "uploads/temp"

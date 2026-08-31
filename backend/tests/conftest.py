@@ -119,6 +119,34 @@ def admin_user_and_token(db: Session):
 
 
 @pytest.fixture
+def viewer_user_and_token(db: Session):
+    """Fixture providing an authenticated Viewer citizen user and Bearer token."""
+    from app.core.security import hash_password
+    email = f"viewer_test_{uuid.uuid4().hex[:6]}@example.com"
+    user = User(
+        email=email,
+        password_hash=hash_password("ViewerPassword#123"),
+        role=UserRole.VIEWER,
+        organization_name="Citizen Observer",
+        organization_domain="example.com",
+        is_active=True,
+        is_verified=True,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    token = create_access_token(user.id, UserRole.VIEWER)
+    return user, token
+
+
+@pytest.fixture
+def viewer_headers(viewer_user_and_token):
+    """Convenience fixture returning Authorization headers for a viewer."""
+    _, token = viewer_user_and_token
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture
 def publisher_headers(publisher_user_and_token):
     """Convenience fixture returning Authorization headers for a publisher."""
     _, token = publisher_user_and_token

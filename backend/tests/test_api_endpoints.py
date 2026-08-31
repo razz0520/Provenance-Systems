@@ -259,22 +259,37 @@ def test_credentials_and_admin_endpoints(client, publisher_user_and_token, admin
     assert new_cred_res.status_code == 201
     cred_id = new_cred_res.json()["id"]
 
-    # Suspend credential
-    susp_res = client.put(
+    # Attempt to suspend credential as publisher -> MUST be 403 Forbidden
+    susp_pub_res = client.put(
         f"/api/v1/credentials/{cred_id}/suspend",
         headers={"Authorization": f"Bearer {pub_token}"},
     )
-    assert susp_res.status_code == 200
-    assert susp_res.json()["status"] == "SUSPENDED"
+    assert susp_pub_res.status_code == 403
 
-    # Revoke credential
-    rev_res = client.put(
+    # Attempt to revoke credential as publisher -> MUST be 403 Forbidden
+    rev_pub_res = client.put(
         f"/api/v1/credentials/{cred_id}/revoke",
         headers={"Authorization": f"Bearer {pub_token}"},
         json={"reason": "Key rotation requested"},
     )
-    assert rev_res.status_code == 200
-    assert rev_res.json()["status"] == "REVOKED"
+    assert rev_pub_res.status_code == 403
+
+    # Suspend credential as Admin -> MUST succeed (200)
+    susp_admin_res = client.put(
+        f"/api/v1/credentials/{cred_id}/suspend",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert susp_admin_res.status_code == 200
+    assert susp_admin_res.json()["status"] == "SUSPENDED"
+
+    # Revoke credential as Admin -> MUST succeed (200)
+    rev_admin_res = client.put(
+        f"/api/v1/credentials/{cred_id}/revoke",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"reason": "Administrative revocation"},
+    )
+    assert rev_admin_res.status_code == 200
+    assert rev_admin_res.json()["status"] == "REVOKED"
 
     # Admin: List users
     users_res = client.get(

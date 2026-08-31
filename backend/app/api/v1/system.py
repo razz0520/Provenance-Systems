@@ -44,6 +44,44 @@ def health_check() -> Any:
 
 
 @router.get(
+    "/health/liveness",
+    summary="Liveness probe: verifies application process is running",
+)
+@router.get("/health/live", include_in_schema=False)
+def liveness_check() -> Any:
+    """Liveness probe returning 200 OK immediately."""
+    return {
+        "status": "alive",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@router.get(
+    "/health/readiness",
+    summary="Readiness probe: verifies PostgreSQL and core services are reachable",
+)
+@router.get("/health/ready", include_in_schema=False)
+def readiness_check() -> Any:
+    """Readiness probe checking PostgreSQL and core service connectivity."""
+    db_ok = check_db_connection()
+    redis_client = get_redis_client()
+    redis_ok = False
+    if redis_client:
+        try:
+            redis_ok = bool(redis_client.ping())
+        except Exception:
+            redis_ok = False
+
+    is_ready = db_ok
+    return {
+        "status": "ready" if is_ready else "not_ready",
+        "database": "connected" if db_ok else "disconnected",
+        "redis": "connected" if redis_ok else "disconnected",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@router.get(
     "/api/v1/status",
     response_model=StatusResponse,
     summary="High-level provenance system status",

@@ -19,8 +19,10 @@ from app.core.hash_service import (
     generate_audio_fingerprint,
     generate_image_dhash,
     generate_image_phash,
+    generate_pdf_fingerprint,
     generate_video_phash,
 )
+from app.core.upload_validation import validate_file_payload
 from app.core.signature_service import (
     create_manifest,
     deserialize_private_key,
@@ -46,7 +48,7 @@ logger = logging.getLogger(__name__)
 
 
 class PublisherService:
-    """Handles content registration, manifest generation, and lifecycle management."""
+    """Publisher operations: Registration, Content Management, and Manifest Signing."""
 
     @staticmethod
     def _determine_content_type(filename: str, mime_type: str) -> ContentType:
@@ -104,180 +106,195 @@ class PublisherService:
             logger.error("Failed to save uploaded file: %s", e)
             raise IOError(f"Could not store uploaded file: {e}") from e
 
-        file_size = os.path.getsize(saved_path)
-        mime_type = upload_file.content_type or "application/octet-stream"
-        content_type = cls._determine_content_type(original_name, mime_type)
-
-        # Step 1: Calculate SHA-256
-        sha256_hash = calculate_file_hash(saved_path)
-
-        # Check duplicate
-        existing = db.execute(
-            select(RegisteredContent).where(
-                (RegisteredContent.sha256_hash == sha256_hash)
-                & (RegisteredContent.status == ContentStatus.ACTIVE)
-            )
-        ).scalar_one_or_none()
-
-        if existing:
-            # Clean up duplicate file on disk
-            if saved_path.exists():
-                saved_path.unlink()
-            raise ValueError(f"Content with identical SHA-256 ({sha256_hash}) is already registered: ID {existing.id}")
-
-        # Step 2: Calculate Genuine Perceptual Hash
-        perceptual_hash_data: Dict[str, Any] = {}
-        duration_seconds: Optional[float] = None
-
         try:
-            if content_type == ContentType.IMAGE:
-                phash = generate_image_phash(saved_path)
-                dhash = generate_image_dhash(saved_path)
-                perceptual_hash_data = {
-                    "algorithm": "pHash + dHash",
-                    "phash": phash,
-                    "dhash": dhash,
-                }
-            elif content_type == ContentType.VIDEO:
-                v_phash = generate_video_phash(saved_path, fps=1.0)
-                perceptual_hash_data = v_phash
-                duration_seconds = v_phash.get("duration_seconds")
-            elif content_type == ContentType.AUDIO:
-                afp = generate_audio_fingerprint(saved_path)
-                perceptual_hash_data = {
-                    "algorithm": "MFCC + Chroma Fingerprint",
-                    "audio_fingerprint": afp,
-                }
-            elif content_type == ContentType.PDF:
-                perceptual_hash_data = {
-                    "status": "NOT_APPLICABLE",
-                    "media_type": "PDF",
-                    "reason": "Perceptual hashing applies to visual and acoustic media. Document authenticity is verified via SHA-256 cryptographic hashing.",
-                }
-            else:  # TEXT
-                perceptual_hash_data = {
-                    "status": "NOT_APPLICABLE",
-                    "media_type": "TEXT",
-                    "reason": "Perceptual hashing applies to visual and acoustic media. Statement authenticity is verified via SHA-256 cryptographic hashing.",
-                }
-        except Exception as e:
-            logger.warning("Perceptual hashing exception for %s: %s", saved_path, e)
-            perceptual_hash_data = {
-                "status": "FAILED",
-                "error": str(e),
-                "reason": "Could not compute media perceptual fingerprint.",
-            }
+            # Validate uploaded file payload defensively
+            is_valid, err_msg = validate_file_payload(saved_path, filename=original_name)
+            if not is_valid:
+                if saved_path.exists():
+                    saved_path.unlink()
+                raise ValueError(err_msg or "Invalid file upload payload.")
 
-        # Step 3: Find or create active Credential for publisher
-        credential = db.execute(
-            select(Credential).where(
-                (Credential.publisher_id == publisher.id)
-                & (Credential.status == CredentialStatus.ACTIVE)
-            ).order_by(desc(Credential.valid_until))
-        ).scalars().first()
+            file_size = os.path.getsize(saved_path)
+            mime_type = upload_file.content_type or "application/octet-stream"
+            content_type = cls._determine_content_type(original_name, mime_type)
 
-        if not credential:
-            # Create a default primary credential if missing
-            now = datetime.now(timezone.utc)
-            credential = Credential(
-                publisher_id=publisher.id,
-                credential_type=CredentialType.PRIMARY,
-                status=CredentialStatus.ACTIVE,
-                valid_from=now,
-                valid_until=now + timedelta(days=365),
-            )
-            db.add(credential)
-            db.flush()
+            # Step 1: Calculate SHA-256
+            sha256_hash = calculate_file_hash(saved_path)
 
-        # Step 4: Create RegisteredContent record
-        registered_content = RegisteredContent(
-            publisher_id=publisher.id,
-            credential_id=credential.id,
-            content_type=content_type,
-            original_filename=original_name,
-            stored_filename=unique_stored_name,
-            sha256_hash=sha256_hash,
-            perceptual_hash=perceptual_hash_data,
-            watermark_data=metadata.get("watermark") if metadata else None,
-            file_size=file_size,
-            mime_type=mime_type,
-            duration_seconds=duration_seconds,
-            status=ContentStatus.ACTIVE,
-        )
-        db.add(registered_content)
-        db.flush()
+            # Check duplicate
+            existing = db.execute(
+                select(RegisteredContent).where(
+                    (RegisteredContent.sha256_hash == sha256_hash)
+                    & (RegisteredContent.status == ContentStatus.ACTIVE)
+                )
+            ).scalar_one_or_none()
 
-        # Step 5: Keypair Management & Signing
-        if private_key_pem:
-            priv_key = deserialize_private_key(private_key_pem)
-            pub_key = priv_key.public_key()
-            pub_pem = serialize_public_key(pub_key)
-        else:
-            # Generate or use publisher keypair
-            priv_key, pub_key = generate_ed25519_keypair()
-            pub_pem = serialize_public_key(pub_key)
-            if not publisher.public_key:
-                publisher.public_key = pub_pem
+            if existing:
+                # Clean up duplicate file on disk
+                if saved_path.exists():
+                    saved_path.unlink()
+                raise ValueError(f"Content with identical SHA-256 ({sha256_hash}) is already registered: ID {existing.id}")
+
+            # Step 2: Calculate Genuine Perceptual Hash
+            perceptual_hash_data: Dict[str, Any] = {}
+            duration_seconds: Optional[float] = None
+
+            try:
+                if content_type == ContentType.IMAGE:
+                    phash = generate_image_phash(saved_path)
+                    dhash = generate_image_dhash(saved_path)
+                    perceptual_hash_data = {
+                        "algorithm": "pHash + dHash",
+                        "phash": phash,
+                        "dhash": dhash,
+                    }
+                elif content_type == ContentType.VIDEO:
+                    v_phash = generate_video_phash(saved_path, fps=1.0)
+                    perceptual_hash_data = v_phash
+                    duration_seconds = v_phash.get("duration_seconds")
+                elif content_type == ContentType.AUDIO:
+                    afp = generate_audio_fingerprint(saved_path)
+                    perceptual_hash_data = {
+                        "algorithm": "MFCC + Chroma Fingerprint",
+                        "audio_fingerprint": afp,
+                    }
+                elif content_type == ContentType.PDF:
+                    perceptual_hash_data = generate_pdf_fingerprint(saved_path)
+                else:  # TEXT
+                    perceptual_hash_data = {
+                        "status": "NOT_APPLICABLE",
+                        "media_type": "TEXT",
+                        "reason": "Perceptual hashing applies to visual and acoustic media. Statement authenticity is verified via SHA-256 cryptographic hashing.",
+                    }
+            except Exception as e:
+                logger.warning("Perceptual hashing exception for %s: %s", saved_path, e)
+                perceptual_hash_data = {
+                    "status": "FAILED",
+                    "error": str(e),
+                    "reason": "Could not compute media perceptual fingerprint.",
+                }
+
+            # Step 3: Find or create active Credential for publisher
+            credential = db.execute(
+                select(Credential).where(
+                    (Credential.publisher_id == publisher.id)
+                    & (Credential.status == CredentialStatus.ACTIVE)
+                ).order_by(desc(Credential.valid_until))
+            ).scalars().first()
+
+            if not credential:
+                # Create a default primary credential if missing
+                now = datetime.now(timezone.utc)
+                credential = Credential(
+                    publisher_id=publisher.id,
+                    credential_type=CredentialType.PRIMARY,
+                    status=CredentialStatus.ACTIVE,
+                    valid_from=now,
+                    valid_until=now + timedelta(days=365),
+                )
+                db.add(credential)
                 db.flush()
 
-        # Generate standardized provenance manifest
-        manifest_payload = create_manifest(
-            publisher_id=publisher.id,
-            content_hash=sha256_hash,
-            content_type=content_type.value,
-            metadata=metadata or {},
-        )
-        # Anchor the signing public key in the manifest for self-contained proof
-        manifest_payload["publisher_public_key"] = pub_pem
-        manifest_payload["publisher_name"] = publisher.organization_name
-        manifest_payload["publisher_domain"] = publisher.organization_domain
+            # Step 4: Create RegisteredContent record
+            registered_content = RegisteredContent(
+                publisher_id=publisher.id,
+                credential_id=credential.id,
+                content_type=content_type,
+                original_filename=original_name,
+                stored_filename=unique_stored_name,
+                sha256_hash=sha256_hash,
+                perceptual_hash=perceptual_hash_data,
+                watermark_data=metadata.get("watermark") if metadata else None,
+                file_size=file_size,
+                mime_type=mime_type,
+                duration_seconds=duration_seconds,
+                status=ContentStatus.ACTIVE,
+            )
+            db.add(registered_content)
+            db.flush()
 
-        # Sign manifest
-        signature = sign_manifest(manifest_payload, priv_key)
+            # Step 5: Keypair Management & Signing
+            if private_key_pem:
+                priv_key = deserialize_private_key(private_key_pem)
+                pub_key = priv_key.public_key()
+                pub_pem = serialize_public_key(pub_key)
+            else:
+                # Generate or use publisher keypair
+                priv_key, pub_key = generate_ed25519_keypair()
+                pub_pem = serialize_public_key(pub_key)
+                if not publisher.public_key:
+                    publisher.public_key = pub_pem
+                    db.flush()
 
-        manifest = CryptographicManifest(
-            content_id=registered_content.id,
-            manifest_data=manifest_payload,
-            digital_signature=signature,
-            signing_algorithm="Ed25519",
-        )
-        db.add(manifest)
-        db.flush()
+            # Generate standardized provenance manifest
+            manifest_payload = create_manifest(
+                publisher_id=publisher.id,
+                content_hash=sha256_hash,
+                content_type=content_type.value,
+                metadata=metadata or {},
+            )
+            # Anchor the signing public key in the manifest for self-contained proof
+            manifest_payload["publisher_public_key"] = pub_pem
+            manifest_payload["publisher_name"] = publisher.organization_name
+            manifest_payload["publisher_domain"] = publisher.organization_domain
 
-        # Step 6: Anchor to Hash Chain
-        chain_entry = add_block(
-            db=db,
-            content_id=registered_content.id,
-            data={
-                "sha256": sha256_hash,
-                "publisher_id": str(publisher.id),
-                "original_filename": original_name,
-                "signature": signature[:16] + "...",
-            },
-        )
+            # Sign manifest
+            signature = sign_manifest(manifest_payload, priv_key)
 
-        # Step 7: Audit Log
-        audit = AuditLog(
-            actor_id=publisher.id,
-            action="CONTENT_REGISTER",
-            details={
-                "content_id": str(registered_content.id),
-                "sha256": sha256_hash,
-                "filename": original_name,
-                "chain_block": chain_entry.id,
-            },
-        )
-        db.add(audit)
-        db.commit()
-        db.refresh(registered_content)
+            manifest = CryptographicManifest(
+                content_id=registered_content.id,
+                manifest_data=manifest_payload,
+                digital_signature=signature,
+                signing_algorithm="Ed25519",
+            )
+            db.add(manifest)
+            db.flush()
 
-        logger.info(
-            "Registered content %s by publisher %s (Chain Block #%d)",
-            registered_content.id,
-            publisher.id,
-            chain_entry.id,
-        )
-        return registered_content
+            # Step 6: Anchor to Hash Chain
+            chain_entry = add_block(
+                db=db,
+                content_id=registered_content.id,
+                data={
+                    "sha256": sha256_hash,
+                    "publisher_id": str(publisher.id),
+                    "original_filename": original_name,
+                    "signature": signature[:16] + "...",
+                },
+            )
+
+            # Step 7: Audit Log
+            audit = AuditLog(
+                actor_id=publisher.id,
+                action="CONTENT_REGISTER",
+                details={
+                    "content_id": str(registered_content.id),
+                    "sha256": sha256_hash,
+                    "filename": original_name,
+                    "chain_block": chain_entry.id,
+                },
+            )
+            db.add(audit)
+            db.commit()
+            db.refresh(registered_content)
+
+            # Invalidate verification caches upon new registration
+            from app.services.whatsapp_service import clear_verification_cache
+            clear_verification_cache()
+
+            logger.info(
+                "Registered content %s by publisher %s (Chain Block #%d)",
+                registered_content.id,
+                publisher.id,
+                chain_entry.id,
+            )
+            return registered_content
+        except Exception:
+            if saved_path.exists():
+                try:
+                    saved_path.unlink()
+                except Exception:
+                    pass
+            raise
 
     @classmethod
     def get_content(cls, db: Session, content_id: Union[str, uuid.UUID]) -> Optional[RegisteredContent]:
@@ -351,6 +368,11 @@ class PublisherService:
         db.add(audit)
         db.commit()
         db.refresh(old_content)
+
+        # Invalidate verification caches
+        from app.services.whatsapp_service import clear_verification_cache
+        clear_verification_cache()
+
         return old_content
 
     @classmethod
@@ -377,6 +399,11 @@ class PublisherService:
         db.add(audit)
         db.commit()
         db.refresh(content)
+
+        # Invalidate verification caches
+        from app.services.whatsapp_service import clear_verification_cache
+        clear_verification_cache()
+
         return content
 
 
