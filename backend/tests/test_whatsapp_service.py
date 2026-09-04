@@ -1152,3 +1152,97 @@ def test_handle_webhook_batch_and_caps(db: Session):
         mock_send.return_value = True
         res_over = handle_webhook(over_payload, db=db)
         assert res_over["processed_count"] == 20  # capped at MAX_BATCH_MESSAGES
+
+
+# ============================================================================
+# 12. Casual Small-Talk and Text Routing Tests
+# ============================================================================
+
+def test_casual_small_talk_and_text_routing(db: Session):
+    """Test casual small talk is silently dropped while greetings and official text verify."""
+    def make_msg(text_content: str) -> dict:
+        unique_phone = f"91{uuid.uuid4().int % 10000000000:010d}"
+        return {
+            "from": unique_phone,
+            "id": f"wamid.{uuid.uuid4().hex}",
+            "type": "text",
+            "text": {"body": text_content},
+        }
+
+    with patch("app.services.whatsapp_service.WhatsAppService.send_whatsapp_message") as mock_send_txt, \
+         patch("app.services.whatsapp_service.WhatsAppService.send_interactive_message") as mock_send_int, \
+         patch("app.services.whatsapp_service.WhatsAppService.mark_message_as_read", return_value=True):
+        mock_send_txt.return_value = True
+        mock_send_int.return_value = True
+
+        # 1. "hi" -> existing greeting behavior
+        res_hi = process_message(make_msg("hi"), sender_name="Citizen", db=db)
+        assert res_hi.get("type") == "help"
+        assert mock_send_int.called
+        mock_send_int.reset_mock()
+        mock_send_txt.reset_mock()
+
+        # 2. "hello" -> existing greeting behavior
+        res_hello = process_message(make_msg("hello"), sender_name="Citizen", db=db)
+        assert res_hello.get("type") == "help"
+        assert mock_send_int.called
+        mock_send_int.reset_mock()
+        mock_send_txt.reset_mock()
+
+        # 3. "thanks" -> no response
+        res_thanks = process_message(make_msg("thanks"), sender_name="Citizen", db=db)
+        assert res_thanks.get("type") == "small_talk_ignored"
+        assert not mock_send_txt.called
+        assert not mock_send_int.called
+
+        # 4. "thank you" -> no response
+        res_ty = process_message(make_msg("thank you"), sender_name="Citizen", db=db)
+        assert res_ty.get("type") == "small_talk_ignored"
+        assert not mock_send_txt.called
+        assert not mock_send_int.called
+
+        # 5. "okay" -> no response
+        res_okay = process_message(make_msg("okay"), sender_name="Citizen", db=db)
+        assert res_okay.get("type") == "small_talk_ignored"
+        assert not mock_send_txt.called
+        assert not mock_send_int.called
+
+        # 6. "bye" -> no response
+        res_bye = process_message(make_msg("bye"), sender_name="Citizen", db=db)
+        assert res_bye.get("type") == "small_talk_ignored"
+        assert not mock_send_txt.called
+        assert not mock_send_int.called
+
+        # 7. standalone casual emoji -> no response
+        for emoji_text in ["👍", "🙏", "❤️", "😊", "😂", "👏", "👌"]:
+            res_emoji = process_message(make_msg(emoji_text), sender_name="Citizen", db=db)
+            assert res_emoji.get("type") == "small_talk_ignored", f"Failed for emoji: {emoji_text}"
+            assert not mock_send_txt.called
+            assert not mock_send_int.called
+
+        # 8. random normal text -> existing verification flow
+        res_random = process_message(make_msg("Government Advisory Notification Ref 90214"), sender_name="Citizen", db=db)
+        assert res_random.get("type") == "text_verification"
+        assert mock_send_int.called
+        mock_send_int.reset_mock()
+
+        # 9. "verify this document" -> NOT classified as small talk
+        res_cmd = process_message(make_msg("verify this document"), sender_name="Citizen", db=db)
+        assert res_cmd.get("type") == "text_verification"
+        assert mock_send_int.called
+        mock_send_int.reset_mock()
+
+        # 10. "The Ministry thanks citizens for their cooperation." -> NOT classified as small talk
+        statement_text = "The Ministry thanks citizens for their cooperation."
+        res_stmt = process_message(make_msg(statement_text), sender_name="Citizen", db=db)
+        assert res_stmt.get("type") == "text_verification"
+        assert mock_send_int.called
+        mock_send_int.reset_mock()
+
+        # 11. A long message containing "thanks" -> NOT classified as small talk
+        long_text = "Important press circular regarding tax compliance: Thanks to all taxpayers for timely submission before deadline."
+        res_long = process_message(make_msg(long_text), sender_name="Citizen", db=db)
+        assert res_long.get("type") == "text_verification"
+        assert mock_send_int.called
+        mock_send_int.reset_mock()
+

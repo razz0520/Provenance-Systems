@@ -154,8 +154,9 @@ def test_google_auth_url(client):
 def test_content_registration_and_verification_pipeline(client, publisher_user_and_token):
     publisher, token = publisher_user_and_token
 
-    # Create synthetic test image with texture
-    img_arr = np.random.RandomState(42).randint(0, 255, (120, 120, 3), dtype=np.uint8)
+    # Create synthetic test image with unique entropy
+    unique_seed = int(uuid.uuid4().int % 1000000)
+    img_arr = np.random.RandomState(unique_seed).randint(0, 255, (120, 120, 3), dtype=np.uint8)
     img = Image.fromarray(img_arr)
     img_byte_arr = io.BytesIO()
     img.save(img_byte_arr, format="PNG")
@@ -200,7 +201,8 @@ def test_content_registration_and_verification_pipeline(client, publisher_user_a
     assert get_v_res.json()["verdict"] == "VERIFIED"
 
     # Step 5: Verify an unregistered file -> Should be UNSIGNED
-    fake_arr = np.random.RandomState(999).randint(0, 255, (120, 120, 3), dtype=np.uint8)
+    fake_seed = (unique_seed + 9999) % 1000000
+    fake_arr = np.random.RandomState(fake_seed).randint(0, 255, (120, 120, 3), dtype=np.uint8)
     fake_img = Image.fromarray(fake_arr)
     fake_bytes = io.BytesIO()
     fake_img.save(fake_bytes, format="PNG")
@@ -217,7 +219,8 @@ def test_text_verification_endpoint(client, publisher_user_and_token):
     publisher, token = publisher_user_and_token
 
     # Register text file
-    official_statement = b"Official Government Gazette: National Holiday on August 22, 2026."
+    statement_str = f"Official Government Gazette: National Holiday on August 22, 2026. Ref: {uuid.uuid4().hex}"
+    official_statement = statement_str.encode("utf-8")
     reg_res = client.post(
         "/api/v1/content/register",
         headers={"Authorization": f"Bearer {token}"},
@@ -228,7 +231,7 @@ def test_text_verification_endpoint(client, publisher_user_and_token):
     # Verify matching text
     v_res = client.post(
         "/api/v1/verify/text",
-        json={"text": "Official Government Gazette: National Holiday on August 22, 2026."},
+        json={"text": statement_str},
     )
     assert v_res.status_code == 200
     assert v_res.json()["verdict"] == "VERIFIED"

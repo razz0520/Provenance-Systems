@@ -18,6 +18,7 @@ import logging
 import mimetypes
 import os
 from pathlib import Path
+import re
 import tempfile
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -265,6 +266,40 @@ class WhatsAppService:
                 logger.debug("Redis verification cache set error: %s", e)
 
     @classmethod
+    def is_casual_small_talk(cls, text: str) -> bool:
+        """
+        Identify whether an incoming text message is strictly casual small talk.
+        Enforces:
+        1. Length safety: maximum 60 characters after normalization.
+        2. Exact full-match only: never matches loose substrings.
+        3. Strips trailing punctuation (. ! ? , : ; ~) before matching.
+        """
+        if not text:
+            return False
+
+        normalized = " ".join(text.strip().split()).lower()
+        if not normalized or len(normalized) > 60:
+            return False
+
+        casual_emojis = {"👍", "🙏", "😊", "😀", "😂", "❤️", "👏", "👌", "❤"}
+        stripped_emojis = "".join(c for c in normalized if c not in casual_emojis and c != "\ufe0f" and not c.isspace())
+        if not stripped_emojis and any(c in casual_emojis for c in normalized):
+            return True
+
+        cleaned = re.sub(r"[.!?,:;~]+$", "", normalized).strip()
+        casual_phrases = {
+            "thanks", "thank you", "thx",
+            "okay", "ok",
+            "sure", "got it",
+            "bye", "goodbye", "see you",
+            "how are you", "what's up",
+            "lol", "haha", "wow",
+            "yes", "yeah", "yep", "yup",
+            "no", "nope",
+        }
+        return cleaned in casual_phrases
+
+    @classmethod
     def handle_webhook(
         cls,
         payload: Dict[str, Any],
@@ -370,7 +405,8 @@ class WhatsAppService:
             text_body = message.get("text", {}).get("body", "").strip()
 
             # Help / Greeting Keywords
-            if text_body.lower() in ["hi", "hello", "hey", "help", "info", "start", "menu", "verify"]:
+            norm_greeting = " ".join(text_body.strip().split()).lower().rstrip("!.,?")
+            if norm_greeting in ["hi", "hii", "hello", "hey", "good morning", "good evening", "help", "info", "start", "menu", "verify"]:
                 help_payload = cls.format_help_response(sender_name=sender_name)
                 cls.send_interactive_message(
                     to_number=from_number,
@@ -378,6 +414,11 @@ class WhatsAppService:
                     buttons=help_payload["buttons"],
                 )
                 return {"type": "help", "recipient": from_number}
+
+            # Casual Small-Talk Filter (Silent Drop / No Response)
+            if cls.is_casual_small_talk(text_body):
+                logger.info("Ignoring casual small-talk message from %s: '%s'", from_number, text_body)
+                return {"type": "small_talk_ignored", "recipient": from_number}
 
             # Verification of press release or text statement (with Redis caching)
             try:
